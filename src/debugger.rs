@@ -805,10 +805,31 @@ impl Debugger {
                 kind: meta.kind,
                 ty: meta.ty,
             };
-            match eval_ctx.read_typed(loc) {
-                Some(value) => println!("{} = {}", var.name, value),
-                None => println!("{} = <unreadable> ({:#x})", var.name, var.address),
-            }
+
+            let text = match meta
+                .ty
+                .and_then(|ty| format_aggregate(&self.print_settings, Some(sym_resolver), &eval_ctx, ty, var.address, 0, None))
+            {
+                Some(agg_text) => with_type_prefix(&self.print_settings, Some(sym_resolver), meta.ty.unwrap(), agg_text),
+                None => match eval_ctx.read_typed(loc) {
+                    Some(value) => {
+                        let text = format_scalar(
+                            &self.print_settings,
+                            Some(sym_resolver),
+                            &eval_ctx,
+                            value,
+                            Some(&eval::Location::Memory(loc)),
+                            None,
+                        );
+                        match meta.ty {
+                            Some(ty) => with_type_prefix(&self.print_settings, Some(sym_resolver), ty, text),
+                            None => text,
+                        }
+                    }
+                    None => format!("<unreadable> ({:#x})", var.address),
+                },
+            };
+            println!("{} = {}", var.name, text);
         }
         Ok(())
     }
