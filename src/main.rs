@@ -6,6 +6,7 @@ mod error;
 mod eval;
 mod process;
 mod symbols;
+mod watchpoint;
 
 use anyhow::Result;
 use clap::Parser;

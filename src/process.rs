@@ -25,6 +25,7 @@ const CONTEXT_CONTROL_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x00100001);
 // needs the full register set (not just Rip/Rsp/EFlags), since unwind codes
 // can reference any non-volatile GPR (Rbp, Rbx, R12-R15, ...).
 const CONTEXT_FULL_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x0010000B);
+const CONTEXT_DEBUG_REGISTERS_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x00100010);
 const DEBUG_ONLY_THIS_PROCESS: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x00000002);
 // Puts the debuggee in its own process group (while still sharing our
 // console) so GenerateConsoleCtrlEvent can target it specifically without
@@ -372,6 +373,36 @@ impl DebuggeeProcess {
     pub fn set_rip(&self, thread_id: u32, rip: u64) -> Result<()> {
         let mut ctx = self.get_thread_context_x64(thread_id)?;
         ctx.Rip = rip;
+        self.set_thread_context_x64(thread_id, &ctx)
+    }
+
+    pub fn get_debug_registers(&self, thread_id: u32) -> Result<AlignedContext> {
+        self.get_thread_context(thread_id, CONTEXT_DEBUG_REGISTERS_X64)
+    }
+
+    // Writes DR0-DR3/DR7 (hardware watchpoint address/control) on one
+    // thread, always clearing DR6 (the status register) at the same time:
+    // debug registers are per-thread, so this must be called on every live
+    // thread to make a watchpoint effective process-wide, and DR6's hit
+    // bits must be cleared after each reported hit or they read as still
+    // pending.
+    pub fn set_debug_registers(
+        &self,
+        thread_id: u32,
+        dr0: u64,
+        dr1: u64,
+        dr2: u64,
+        dr3: u64,
+        dr7: u64,
+    ) -> Result<()> {
+        let mut ctx = AlignedContext(unsafe { std::mem::zeroed() });
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS_X64;
+        ctx.Dr0 = dr0;
+        ctx.Dr1 = dr1;
+        ctx.Dr2 = dr2;
+        ctx.Dr3 = dr3;
+        ctx.Dr6 = 0;
+        ctx.Dr7 = dr7;
         self.set_thread_context_x64(thread_id, &ctx)
     }
 }

@@ -7,6 +7,8 @@ use crate::process;
 use crate::process::{AlignedContext, DebuggeeProcess};
 use crate::symbols;
 use crate::symbols::SymbolResolver;
+use crate::watchpoint::{self, WatchKind, WatchpointManager};
+use std::collections::HashSet;
 use std::io::{self, Write};
 use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT, CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT,
@@ -80,6 +82,12 @@ pub struct Debugger {
     target_path: String,
     process: Option<DebuggeeProcess>,
     breakpoints: BreakpointManager,
+    watchpoints: WatchpointManager,
+    // Thread ids seen via CREATE_PROCESS/CREATE_THREAD debug events, tracked
+    // so a new watchpoint can be pushed to every live thread (debug
+    // registers are per-thread) and a newly created thread can pick up
+    // whatever watchpoints are already active.
+    threads: HashSet<u32>,
     symbols: Option<SymbolResolver>,
     last_event: Option<DEBUG_EVENT>,
     last_thread_id: u32,
@@ -102,6 +110,8 @@ impl Debugger {
             target_path,
             process: None,
             breakpoints: BreakpointManager::new(),
+            watchpoints: WatchpointManager::new(),
+            threads: HashSet::new(),
             symbols: None,
             last_event: None,
             last_thread_id: 0,
@@ -183,6 +193,9 @@ impl Debugger {
                     return Err(DebuggerError::NoBreakpoint);
                 }
             }
+            Command::Watch(expr, kind) => self.set_watchpoint(&expr, kind)?,
+            Command::DeleteWatch(id) => self.delete_watchpoint(id)?,
+            Command::ListWatchpoints => self.list_watchpoints(),
             Command::ListBreakpoints => {
                 let mut list: Vec<_> = self.breakpoints.list().collect();
                 list.sort_by_key(|bp| bp.id);
@@ -247,6 +260,12 @@ impl Debugger {
         self.step_target = None;
         self.step_over_bp = None;
         self.finish_bp = None;
+        // Watchpoint addresses are only meaningful for this process instance
+        // (ASLR may relocate everything on the next run), and debug
+        // registers belong to threads that no longer exist, so tracking
+        // must restart from scratch rather than carry over stale state.
+        self.watchpoints = WatchpointManager::new();
+        self.threads.clear();
         // Hook addresses/original bytes are tied to this specific process
         // instance; a new run needs fresh hooks (and ASLR may relocate the
         // allocator entry points anyway), so tracking must restart from
@@ -533,6 +552,217 @@ impl Debugger {
             eprintln!("No process is running. Use 'run' first.");
         }
         Ok(())
+    }
+
+    // Resolves `raw` to a memory location and arms a hardware watchpoint
+    // (DR0-DR3/DR7) on it. `kind` selects write-only vs. read-or-write.
+    fn set_watchpoint(&mut self, raw: &str, kind: WatchKind) -> Result<()> {
+        if self.process.is_none() {
+            eprintln!("No process is running. Use 'run' first.");
+            return Ok(());
+        }
+
+        let expr = match eval::parse(raw) {
+            Ok(expr) => expr,
+            Err(e) => {
+                eprintln!("{}", e);
+                return Ok(());
+            }
+        };
+
+        // Scoped so the borrow of `self` inside `ctx` ends before this
+        // function needs to mutate `self.watchpoints` below.
+        let (address, size, initial_value) = {
+            let Some(ctx) = self.make_eval_context()? else {
+                return Ok(());
+            };
+            let loc = match eval::eval_location(&expr, &ctx) {
+                Ok(loc) => loc,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return Ok(());
+                }
+            };
+            let eval::Location::Memory(tl) = loc else {
+                eprintln!("Cannot watch a register; expected an addressable expression.");
+                return Ok(());
+            };
+            let Some(size) = watchpoint::hw_size(tl.size) else {
+                eprintln!(
+                    "'{}' is {} bytes, too large for a hardware watchpoint (max 8 bytes).",
+                    raw.trim(),
+                    tl.size
+                );
+                return Ok(());
+            };
+            let initial_value = eval::eval(&expr, &ctx).ok().map(|v| v.as_i64());
+            (tl.address as usize, size, initial_value)
+        };
+
+        match self
+            .watchpoints
+            .add(raw.trim().to_string(), address, size, kind, initial_value)
+        {
+            Some(id) => {
+                self.sync_watchpoints_to_threads()?;
+                println!(
+                    "Watchpoint #{} set on '{}' at {:#x} ({} byte{}, {})",
+                    id,
+                    raw.trim(),
+                    address,
+                    size,
+                    if size == 1 { "" } else { "s" },
+                    kind
+                );
+            }
+            None => eprintln!(
+                "Cannot set watchpoint: all 4 hardware watchpoint slots are already in use."
+            ),
+        }
+        Ok(())
+    }
+
+    fn delete_watchpoint(&mut self, id: usize) -> Result<()> {
+        let Some(wp) = self.watchpoints.remove_by_id(id) else {
+            return Err(DebuggerError::NoWatchpoint);
+        };
+        self.sync_watchpoints_to_threads()?;
+        println!("Deleted watchpoint #{} ('{}')", wp.id, wp.expr);
+        Ok(())
+    }
+
+    fn list_watchpoints(&self) {
+        let mut list: Vec<_> = self.watchpoints.list().collect();
+        list.sort_by_key(|w| w.id);
+        if list.is_empty() {
+            println!("No watchpoints.");
+            return;
+        }
+        for w in list {
+            println!(
+                "#{} {:#x} ({} byte{}, {}): '{}'",
+                w.id,
+                w.address,
+                w.size,
+                if w.size == 1 { "" } else { "s" },
+                w.kind,
+                w.expr
+            );
+        }
+    }
+
+    // Pushes the currently active watchpoints' DR0-DR3/DR7 values to every
+    // known thread; debug registers are per-thread, so a watchpoint isn't
+    // effective process-wide until this runs.
+    fn sync_watchpoints_to_threads(&self) -> Result<()> {
+        let Some(proc) = self.process.as_ref() else {
+            return Ok(());
+        };
+        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
+        for &tid in &self.threads {
+            proc.set_debug_registers(tid, dr0, dr1, dr2, dr3, dr7)?;
+        }
+        Ok(())
+    }
+
+    fn apply_watchpoints_to_thread(&self, thread_id: u32) -> Result<()> {
+        let Some(proc) = self.process.as_ref() else {
+            return Ok(());
+        };
+        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
+        proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7)
+    }
+
+    // Reads DR6 on the thread that just single-stepped/trapped and reports
+    // which watchpoint slots (if any) it shows as hit, clearing DR6
+    // afterward so the same hit doesn't appear to still be pending next
+    // time.
+    fn take_watchpoint_hits(&mut self, thread_id: u32) -> Result<Vec<usize>> {
+        if self.watchpoints.list().next().is_none() {
+            return Ok(Vec::new());
+        }
+        let Some(proc) = self.process.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let dr6 = proc.get_debug_registers(thread_id)?.Dr6;
+        let mask = (dr6 & 0xF) as u8;
+        if mask == 0 {
+            return Ok(Vec::new());
+        }
+        let hits = self.watchpoints.slots_hit(mask);
+        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
+        proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7)?;
+        Ok(hits)
+    }
+
+    // Prints old/new (or current) values for each hit watchpoint slot and
+    // the stopped location, then updates each watchpoint's cached value.
+    fn report_watchpoints(&mut self, slots: &[usize], stop_addr: usize) {
+        let Some(proc) = self.process.as_ref() else {
+            return;
+        };
+        let Ok(ctx) = proc.get_full_thread_context_x64(self.last_thread_id) else {
+            return;
+        };
+        let eval_ctx = DebugEvalContext {
+            proc,
+            symbols: self.symbols.as_ref(),
+            thread_id: self.last_thread_id,
+            ctx,
+        };
+
+        for &slot in slots {
+            let Some(wp) = self.watchpoints.get_by_slot(slot) else {
+                continue;
+            };
+            let new_value = eval::parse(&wp.expr)
+                .ok()
+                .and_then(|expr| eval::eval(&expr, &eval_ctx).ok())
+                .map(|v| v.as_i64());
+
+            println!();
+            match wp.kind {
+                WatchKind::Write => {
+                    println!("Watchpoint #{} hit: {}", wp.id, wp.expr);
+                    if let Some(old) = wp.last_value {
+                        println!("Old value = {}", old);
+                    }
+                    match new_value {
+                        Some(new) => println!("New value = {}", new),
+                        // The watched address's original expression no
+                        // longer resolves from here, e.g. a stack local
+                        // whose slot was reused after its frame returned.
+                        None => println!(
+                            "(current value unavailable: '{}' is not in scope here)",
+                            wp.expr
+                        ),
+                    }
+                }
+                WatchKind::Access => {
+                    println!("Watchpoint #{} hit (read/write): {}", wp.id, wp.expr);
+                    match new_value {
+                        Some(v) => println!("Value = {}", v),
+                        None => println!(
+                            "(current value unavailable: '{}' is not in scope here)",
+                            wp.expr
+                        ),
+                    }
+                }
+            }
+
+            if let Some(wp) = self.watchpoints.get_by_slot_mut(slot) {
+                wp.last_value = new_value;
+            }
+        }
+
+        println!(
+            "Stopped at {:#x}{}",
+            stop_addr,
+            describe_address(self.symbols.as_ref(), stop_addr)
+        );
+        if let Some(proc) = self.process.as_ref() {
+            show_context(self.symbols.as_ref(), proc, stop_addr);
+        }
     }
 
     fn list_source(&mut self, target: Option<&str>) -> Result<()> {
@@ -1056,6 +1286,12 @@ impl Debugger {
                             continue;
                         }
                     } else if code.0 as u32 == STATUS_SINGLE_STEP {
+                        // A hardware watchpoint trap also reports as
+                        // STATUS_SINGLE_STEP (both are INT1/#DB), so DR6 must
+                        // be inspected to tell a watchpoint hit apart from
+                        // one of this file's own single-instruction steps.
+                        let watch_hits = self.take_watchpoint_hits(event.dwThreadId)?;
+
                         if let Some((hook_addr, kind)) = self.pending_leak_rearm.take() {
                             let proc = self.process.as_ref().unwrap();
                             let new_byte = proc.set_breakpoint(hook_addr)?;
@@ -1074,6 +1310,19 @@ impl Debugger {
                             }
                         }
                         if was_breakpoint_rearm {
+                            if !watch_hits.is_empty() {
+                                self.step_target = None;
+                                self.report_watchpoints(&watch_hits, address);
+                            }
+                            self.running = false;
+                            self.pending_continue =
+                                Some((event.dwProcessId, event.dwThreadId, DBG_CONTINUE));
+                            return Ok(());
+                        }
+
+                        if !watch_hits.is_empty() {
+                            self.step_target = None;
+                            self.report_watchpoints(&watch_hits, address);
                             self.running = false;
                             self.pending_continue =
                                 Some((event.dwProcessId, event.dwThreadId, DBG_CONTINUE));
@@ -1160,6 +1409,7 @@ impl Debugger {
                 }
                 CREATE_PROCESS_DEBUG_EVENT => {
                     println!("Process created: {}", event.dwProcessId);
+                    self.threads.insert(event.dwThreadId);
                     unsafe {
                         let info = event.u.CreateProcessInfo;
                         if !info.hFile.is_invalid() {
@@ -1182,9 +1432,15 @@ impl Debugger {
                 }
                 CREATE_THREAD_DEBUG_EVENT => {
                     println!("Thread created: {}", event.dwThreadId);
+                    self.threads.insert(event.dwThreadId);
+                    // Debug registers are per-thread and start zeroed, so a
+                    // new thread must be given the currently active
+                    // watchpoints explicitly or it simply won't trap on them.
+                    self.apply_watchpoints_to_thread(event.dwThreadId)?;
                 }
                 EXIT_THREAD_DEBUG_EVENT => {
                     println!("Thread exited: {}", event.dwThreadId);
+                    self.threads.remove(&event.dwThreadId);
                 }
                 LOAD_DLL_DEBUG_EVENT => unsafe {
                     let info = event.u.LoadDll;

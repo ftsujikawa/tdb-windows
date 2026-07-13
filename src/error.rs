@@ -20,6 +20,9 @@ pub enum DebuggerError {
     #[error("No active breakpoint")]
     NoBreakpoint,
 
+    #[error("No active watchpoint")]
+    NoWatchpoint,
+
     #[error("Symbol not found: {0}")]
     SymbolNotFound(String),
 

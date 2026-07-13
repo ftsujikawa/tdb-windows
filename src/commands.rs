@@ -1,4 +1,5 @@
 use crate::error::{DebuggerError, Result};
+use crate::watchpoint::WatchKind;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShowKind {
@@ -34,6 +35,9 @@ pub enum Command {
     Break(String),
     Delete(usize),
     ListBreakpoints,
+    Watch(String, WatchKind),
+    DeleteWatch(usize),
+    ListWatchpoints,
     Registers,
     Memory { address: String, count: usize },
     Backtrace,
@@ -95,6 +99,37 @@ pub fn parse(input: &str) -> Result<Command> {
             Ok(Command::Delete(id))
         }
         "bl" | "breakpoints" => Ok(Command::ListBreakpoints),
+        "watch" => {
+            if args.is_empty() {
+                return Err(DebuggerError::InvalidCommand(
+                    "watch requires an expression".to_string(),
+                ));
+            }
+            Ok(Command::Watch(args.join(" "), WatchKind::Write))
+        }
+        "awatch" | "rwatch" => {
+            if args.is_empty() {
+                return Err(DebuggerError::InvalidCommand(
+                    "awatch requires an expression".to_string(),
+                ));
+            }
+            Ok(Command::Watch(args.join(" "), WatchKind::Access))
+        }
+        "dw" | "deletewatch" => {
+            if args.is_empty() {
+                return Err(DebuggerError::InvalidCommand(
+                    "deletewatch requires a watchpoint number".to_string(),
+                ));
+            }
+            let id = args[0].parse::<usize>().map_err(|_| {
+                DebuggerError::InvalidCommand(format!(
+                    "invalid watchpoint number: {}",
+                    args[0]
+                ))
+            })?;
+            Ok(Command::DeleteWatch(id))
+        }
+        "wl" | "watchpoints" => Ok(Command::ListWatchpoints),
         "l" | "list" => Ok(Command::List(if args.is_empty() {
             None
         } else {
@@ -273,6 +308,10 @@ pub fn help_text() -> &'static str {
   b, break <addr|symbol|file:line>  Set breakpoint
   d, delete <#>                 Delete breakpoint by number
   bl, breakpoints              List breakpoints
+  watch <expr>                 Break when <expr> is written (hardware watchpoint)
+  awatch, rwatch <expr>        Break when <expr> is read or written
+  dw, deletewatch <#>           Delete watchpoint by number
+  wl, watchpoints              List watchpoints
   l, list [addr|symbol|file:line]  Show source (current position if omitted)
   regs, registers              Show registers
   x, memory <addr> [count]     Dump memory
