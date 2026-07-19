@@ -562,8 +562,12 @@ pub trait EvalContext {
     fn read_typed(&self, loc: TypedLocation) -> Option<Value>;
     fn write_typed(&self, loc: TypedLocation, value: Value) -> bool;
     fn variable(&self, name: &str) -> Option<Location>;
-    fn register(&self, name: &str) -> Option<i64>;
-    fn write_register(&self, name: &str, value: i64) -> bool;
+    // Most registers are Value::Int; a handful (the x87 ST0-ST7 stack, which
+    // hold 80-bit extended-precision values) are Value::Float instead, so
+    // `set $st0 = 3.14` assigns the float itself rather than truncating it
+    // to an integer first.
+    fn register(&self, name: &str) -> Option<Value>;
+    fn write_register(&self, name: &str, value: Value) -> bool;
 
     /// Whether `ty` is a pointer, array, or neither (needed to tell apart
     /// `p[i]` where p is a pointer, indexing through its *value*, from
@@ -582,7 +586,6 @@ fn read_location(loc: &Location, ctx: &dyn EvalContext) -> Result<Value, String>
             .ok_or_else(|| format!("cannot read memory at {:#x}", tl.address)),
         Location::Register(name) => ctx
             .register(name)
-            .map(Value::Int)
             .ok_or_else(|| format!("unknown register: ${}", name)),
     }
 }
@@ -596,7 +599,6 @@ pub fn eval(expr: &Expr, ctx: &dyn EvalContext) -> Result<Value, String> {
         }
         Expr::Register(name) => ctx
             .register(name)
-            .map(Value::Int)
             .ok_or_else(|| format!("unknown register: ${}", name)),
         Expr::Unary(op, inner) => match op {
             UnOp::AddrOf => match eval_location(inner, ctx)? {

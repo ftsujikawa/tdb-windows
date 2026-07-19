@@ -8,7 +8,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, GetThreadContext, ReadProcessMemory, SetThreadContext, WaitForDebugEventEx,
-    WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, DEBUG_EVENT,
+    WriteProcessMemory, CONTEXT, CONTEXT_FLAGS, DEBUG_EVENT, M128A,
 };
 use windows::Win32::System::Memory::{
     VirtualProtectEx, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
@@ -85,33 +85,71 @@ impl std::ops::DerefMut for AlignedContext {
     }
 }
 
+// Parses "<prefix><n>" (e.g. "mm3", "xmm12") into n, bounded to < max.
+fn indexed_register(name: &str, prefix: &str, max: usize) -> Option<usize> {
+    let i: usize = name.strip_prefix(prefix)?.parse().ok()?;
+    (i < max).then_some(i)
+}
+
+fn mm_index(name: &str) -> Option<usize> {
+    indexed_register(name, "mm", 8)
+}
+
+fn st_index(name: &str) -> Option<usize> {
+    indexed_register(name, "st", 8)
+}
+
+// "xmmN" is the low 64 bits, "xmmNh" the high 64 bits: a full 128-bit value
+// doesn't fit this file's i64-based register plumbing, so the two halves
+// are addressed as separate pseudo-registers instead.
+fn xmm_index(name: &str) -> Option<(usize, bool)> {
+    match name.strip_suffix('h') {
+        Some(n) => indexed_register(n, "xmm", 16).map(|i| (i, true)),
+        None => indexed_register(name, "xmm", 16).map(|i| (i, false)),
+    }
+}
+
 impl AlignedContext {
     pub fn register(&self, name: &str) -> Option<i64> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "rax" => self.Rax as i64,
-            "rbx" => self.Rbx as i64,
-            "rcx" => self.Rcx as i64,
-            "rdx" => self.Rdx as i64,
-            "rsi" => self.Rsi as i64,
-            "rdi" => self.Rdi as i64,
-            "rbp" => self.Rbp as i64,
-            "rsp" => self.Rsp as i64,
-            "rip" => self.Rip as i64,
-            "r8" => self.R8 as i64,
-            "r9" => self.R9 as i64,
-            "r10" => self.R10 as i64,
-            "r11" => self.R11 as i64,
-            "r12" => self.R12 as i64,
-            "r13" => self.R13 as i64,
-            "r14" => self.R14 as i64,
-            "r15" => self.R15 as i64,
-            "eflags" => self.EFlags as i64,
-            _ => return None,
-        })
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "rax" => return Some(self.Rax as i64),
+            "rbx" => return Some(self.Rbx as i64),
+            "rcx" => return Some(self.Rcx as i64),
+            "rdx" => return Some(self.Rdx as i64),
+            "rsi" => return Some(self.Rsi as i64),
+            "rdi" => return Some(self.Rdi as i64),
+            "rbp" => return Some(self.Rbp as i64),
+            "rsp" => return Some(self.Rsp as i64),
+            "rip" => return Some(self.Rip as i64),
+            "r8" => return Some(self.R8 as i64),
+            "r9" => return Some(self.R9 as i64),
+            "r10" => return Some(self.R10 as i64),
+            "r11" => return Some(self.R11 as i64),
+            "r12" => return Some(self.R12 as i64),
+            "r13" => return Some(self.R13 as i64),
+            "r14" => return Some(self.R14 as i64),
+            "r15" => return Some(self.R15 as i64),
+            "eflags" => return Some(self.EFlags as i64),
+            "mxcsr" => return Some(unsafe { self.Anonymous.FltSave.MxCsr } as i64),
+            _ => {}
+        }
+        // Only meaningful when the context was fetched with
+        // CONTEXT_FLOATING_POINT (get_full_thread_context_x64); otherwise
+        // this reads back zeroed, unpopulated memory.
+        if let Some(i) = mm_index(&name) {
+            return Some(unsafe { self.Anonymous.FltSave.FloatRegisters[i].Low } as i64);
+        }
+        if let Some((i, high)) = xmm_index(&name) {
+            let reg = unsafe { self.Anonymous.FltSave.XmmRegisters[i] };
+            return Some(if high { reg.High } else { reg.Low as i64 });
+        }
+        None
     }
 
     pub fn set_register(&mut self, name: &str, value: i64) -> bool {
-        match name.to_ascii_lowercase().as_str() {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
             "rax" => self.Rax = value as u64,
             "rbx" => self.Rbx = value as u64,
             "rcx" => self.Rcx = value as u64,
@@ -130,10 +168,118 @@ impl AlignedContext {
             "r14" => self.R14 = value as u64,
             "r15" => self.R15 = value as u64,
             "eflags" => self.EFlags = value as u32,
-            _ => return false,
+            // Assignment through a union field is safe in Rust (only
+            // *reading* one can be UB), so this needs no unsafe block.
+            "mxcsr" => self.Anonymous.FltSave.MxCsr = value as u32,
+            _ => {
+                if let Some(i) = mm_index(&name) {
+                    unsafe { self.Anonymous.FltSave.FloatRegisters[i].Low = value as u64 };
+                } else if let Some((i, high)) = xmm_index(&name) {
+                    unsafe {
+                        if high {
+                            self.Anonymous.FltSave.XmmRegisters[i].High = value;
+                        } else {
+                            self.Anonymous.FltSave.XmmRegisters[i].Low = value as u64;
+                        }
+                    }
+                } else {
+                    return false;
+                }
+            }
         }
         true
     }
+
+    // ST0-ST7 hold 80-bit x87 extended-precision values, which don't fit
+    // this file's i64 register plumbing; these two methods are the
+    // float-valued counterpart of register()/set_register() for them.
+    pub fn register_f64(&self, name: &str) -> Option<f64> {
+        let i = st_index(&name.to_ascii_lowercase())?;
+        let reg = unsafe { self.Anonymous.FltSave.FloatRegisters[i] };
+        Some(decode_x87_extended(reg.Low, reg.High as u64))
+    }
+
+    pub fn set_register_f64(&mut self, name: &str, value: f64) -> bool {
+        let Some(i) = st_index(&name.to_ascii_lowercase()) else {
+            return false;
+        };
+        let (low, high) = encode_x87_extended(value);
+        unsafe {
+            self.Anonymous.FltSave.FloatRegisters[i] = M128A { Low: low, High: high };
+        }
+        true
+    }
+}
+
+// Decodes an 80-bit x87 extended-precision value (FXSAVE layout: a 64-bit
+// mantissa in `mantissa`, then a 1-bit sign + 15-bit biased exponent in the
+// low 16 bits of `high`) into the nearest f64. Precision beyond f64's
+// 52-bit mantissa is lost, an accepted trade-off for a register
+// display/edit convenience rather than exact arithmetic.
+pub fn decode_x87_extended(mantissa: u64, high: u64) -> f64 {
+    let sign_exp = (high & 0xffff) as u16;
+    let sign = ((sign_exp >> 15) & 1) as u64;
+    let exponent = (sign_exp & 0x7fff) as i64;
+
+    if exponent == 0 && mantissa == 0 {
+        return f64::from_bits(sign << 63);
+    }
+    if exponent == 0x7fff {
+        return if mantissa == (1u64 << 63) {
+            if sign == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+        } else {
+            f64::NAN
+        };
+    }
+
+    let exp_f64 = exponent - 16383 + 1023;
+    if !(1..0x7ff).contains(&exp_f64) {
+        // Outside f64's normal exponent range: fall back to a coarser but
+        // overflow/underflow-safe approximation rather than constructing an
+        // f64 bit pattern with an invalid exponent field.
+        let significand = mantissa as f64 / (1u64 << 63) as f64;
+        let value = significand * 2f64.powi((exponent - 16383) as i32);
+        return if sign == 1 { -value } else { value };
+    }
+    // Drop the explicit integer bit (extended precision has one, f64's is
+    // implicit) and the low 11 bits of the remaining 63-bit fraction, to
+    // match f64's 52-bit mantissa field.
+    let mantissa_f64 = (mantissa << 1) >> 12;
+    f64::from_bits((sign << 63) | ((exp_f64 as u64) << 52) | mantissa_f64)
+}
+
+// Inverse of decode_x87_extended: widens an f64 into the 80-bit extended
+// layout (explicit integer bit, exponent rebiased from 1023 to 16383).
+// Exact for zero/normal/infinite/NaN values; f64 subnormals (a vanishingly
+// narrow case for a register-set command) are approximated via the same
+// log2-based fallback decode uses for out-of-range values.
+pub fn encode_x87_extended(value: f64) -> (u64, i64) {
+    let bits = value.to_bits();
+    let sign = (bits >> 63) & 1;
+    let exp_f64 = ((bits >> 52) & 0x7ff) as i64;
+    let mantissa_f64 = bits & 0xf_ffff_ffff_ffff;
+
+    if exp_f64 == 0 && mantissa_f64 == 0 {
+        return (0, (sign << 15) as i64);
+    }
+    if exp_f64 == 0x7ff {
+        return if mantissa_f64 == 0 {
+            (1u64 << 63, ((sign << 15) | 0x7fff) as i64)
+        } else {
+            ((1u64 << 63) | (mantissa_f64 << 11), ((sign << 15) | 0x7fff) as i64)
+        };
+    }
+    if exp_f64 == 0 {
+        let normalized = value.abs();
+        let exponent = normalized.log2().floor() as i64;
+        let mantissa_ext = ((normalized / 2f64.powi(exponent as i32)) * (1u64 << 63) as f64) as u64;
+        let biased_exponent = ((exponent + 16383) & 0x7fff) as u64;
+        return (mantissa_ext, ((sign << 15) | biased_exponent) as i64);
+    }
+
+    let exponent_ext = (exp_f64 - 1023 + 16383) as u64;
+    let mantissa_ext = (1u64 << 63) | (mantissa_f64 << 11);
+    (mantissa_ext, ((sign << 15) | (exponent_ext & 0x7fff)) as i64)
 }
 
 pub struct DebuggeeProcess {
@@ -374,6 +520,29 @@ impl DebuggeeProcess {
         let mut ctx = self.get_thread_context_x64(thread_id)?;
         ctx.Rip = rip;
         self.set_thread_context_x64(thread_id, &ctx)
+    }
+
+    // Adds one to the thread's suspend count, independent of (and stacking
+    // on top of) the whole-process freeze the OS already applies while a
+    // debug event is pending: this is what lets a thread stay stopped even
+    // after ContinueDebugEvent lets the rest of the process run again
+    // (`thread lock`'s mechanism, same technique WinDbg's freeze uses).
+    pub fn suspend_thread(&self, thread_id: u32) -> Result<()> {
+        let handle = self.thread_handle(thread_id)?;
+        unsafe {
+            SuspendThread(handle);
+            CloseHandle(handle)?;
+        }
+        Ok(())
+    }
+
+    pub fn resume_thread(&self, thread_id: u32) -> Result<()> {
+        let handle = self.thread_handle(thread_id)?;
+        unsafe {
+            ResumeThread(handle);
+            CloseHandle(handle)?;
+        }
+        Ok(())
     }
 
     pub fn get_debug_registers(&self, thread_id: u32) -> Result<AlignedContext> {

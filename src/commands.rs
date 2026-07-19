@@ -38,6 +38,10 @@ pub enum Command {
     Watch(String, WatchKind),
     DeleteWatch(usize),
     ListWatchpoints,
+    Threads,
+    Thread(u32),
+    Lock(Option<u32>),
+    Unlock,
     Registers,
     Memory { address: String, count: usize },
     Backtrace,
@@ -130,6 +134,28 @@ pub fn parse(input: &str) -> Result<Command> {
             Ok(Command::DeleteWatch(id))
         }
         "wl" | "watchpoints" => Ok(Command::ListWatchpoints),
+        "threads" => Ok(Command::Threads),
+        "thread" => {
+            if args.is_empty() {
+                return Err(DebuggerError::InvalidCommand(
+                    "thread requires a thread id".to_string(),
+                ));
+            }
+            let id = args[0].parse::<u32>().map_err(|_| {
+                DebuggerError::InvalidCommand(format!("invalid thread id: {}", args[0]))
+            })?;
+            Ok(Command::Thread(id))
+        }
+        "lock" => {
+            if args.is_empty() {
+                return Ok(Command::Lock(None));
+            }
+            let id = args[0].parse::<u32>().map_err(|_| {
+                DebuggerError::InvalidCommand(format!("invalid thread id: {}", args[0]))
+            })?;
+            Ok(Command::Lock(Some(id)))
+        }
+        "unlock" => Ok(Command::Unlock),
         "l" | "list" => Ok(Command::List(if args.is_empty() {
             None
         } else {
@@ -312,6 +338,14 @@ pub fn help_text() -> &'static str {
   awatch, rwatch <expr>        Break when <expr> is read or written
   dw, deletewatch <#>           Delete watchpoint by number
   wl, watchpoints              List watchpoints
+  threads                      List threads (current marked with *)
+  thread <id>                  Switch the current thread (affects regs/bt/step/print/show)
+  lock [id]                    Freeze all other threads, running only this one (current if omitted)
+                                Caution: if a frozen thread holds a lock the
+                                running one needs (your own, or an internal
+                                OS/CRT one like the heap lock touched by
+                                malloc/printf), continuing can hang forever.
+  unlock                       Resume all threads frozen by 'lock'
   l, list [addr|symbol|file:line]  Show source (current position if omitted)
   regs, registers              Show registers
   x, memory <addr> [count]     Dump memory
@@ -319,6 +353,9 @@ pub fn help_text() -> &'static str {
   p, print[/fmt] <expr>        Evaluate a C expression
       fmt: x d u o t c f a z s (hex/dec/udec/oct/bin/char/float/addr/zpad/string)
   set <lvalue> = <expr>        Assign to a variable/register
+      registers: $rax.. $r15, $rip, $rsp, $rbp, $eflags, $mxcsr,
+      $mm0-7, $xmm0-15 (low 64 bits, $xmm0h-15h for the high half),
+      $st0-7 (float-valued: assigns the value itself, not its bits)
   set print pretty on|off      Multi-line struct/array formatting
   set print address on|off     Annotate pointers with symbol info
   set print elements <n>|unlimited  Array/string print limit (default 200)

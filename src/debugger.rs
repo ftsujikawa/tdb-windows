@@ -88,6 +88,16 @@ pub struct Debugger {
     // registers are per-thread) and a newly created thread can pick up
     // whatever watchpoints are already active.
     threads: HashSet<u32>,
+    // Set by `lock`: the one thread allowed to run.
+    locked_thread: Option<u32>,
+    // The threads actually holding an extra SuspendThread from `lock`, on
+    // top of the process-wide debug-event freeze. Tracked explicitly
+    // (rather than inferred as "everyone but locked_thread") because a
+    // thread created after `lock` is deliberately left out of this set: new
+    // threads are often OS/CRT-internal helpers (e.g. for buffered I/O)
+    // that the locked thread's own forward progress may depend on, and
+    // freezing them can deadlock the very thread `lock` was letting run.
+    frozen_threads: HashSet<u32>,
     symbols: Option<SymbolResolver>,
     last_event: Option<DEBUG_EVENT>,
     last_thread_id: u32,
@@ -112,6 +122,8 @@ impl Debugger {
             breakpoints: BreakpointManager::new(),
             watchpoints: WatchpointManager::new(),
             threads: HashSet::new(),
+            locked_thread: None,
+            frozen_threads: HashSet::new(),
             symbols: None,
             last_event: None,
             last_thread_id: 0,
@@ -196,6 +208,10 @@ impl Debugger {
             Command::Watch(expr, kind) => self.set_watchpoint(&expr, kind)?,
             Command::DeleteWatch(id) => self.delete_watchpoint(id)?,
             Command::ListWatchpoints => self.list_watchpoints(),
+            Command::Threads => self.list_threads(),
+            Command::Thread(id) => self.switch_thread(id)?,
+            Command::Lock(id) => self.lock_thread(id)?,
+            Command::Unlock => self.unlock_thread()?,
             Command::ListBreakpoints => {
                 let mut list: Vec<_> = self.breakpoints.list().collect();
                 list.sort_by_key(|bp| bp.id);
@@ -211,7 +227,9 @@ impl Debugger {
             }
             Command::Registers => {
                 if let Some(proc) = self.process.as_ref() {
-                    let ctx = proc.get_thread_context_x64(self.last_thread_id)?;
+                    // Needs CONTEXT_FLOATING_POINT (only get_full_thread_context_x64
+                    // requests it), or the FPU/MMX/XMM area below reads back zeroed.
+                    let ctx = proc.get_full_thread_context_x64(self.last_thread_id)?;
                     print_context(&ctx);
                 } else {
                     eprintln!("No process is running.");
@@ -266,6 +284,8 @@ impl Debugger {
         // must restart from scratch rather than carry over stale state.
         self.watchpoints = WatchpointManager::new();
         self.threads.clear();
+        self.locked_thread = None;
+        self.frozen_threads.clear();
         // Hook addresses/original bytes are tied to this specific process
         // instance; a new run needs fresh hooks (and ASLR may relocate the
         // allocator entry points anyway), so tracking must restart from
@@ -677,22 +697,37 @@ impl Debugger {
     // which watchpoint slots (if any) it shows as hit, clearing DR6
     // afterward so the same hit doesn't appear to still be pending next
     // time.
-    fn take_watchpoint_hits(&mut self, thread_id: u32) -> Result<Vec<usize>> {
+    // Never propagates a hard error: this runs on every single-step event
+    // regardless of which thread raised it, and a thread that denies
+    // GetContext/SetContext (the same rare case `lock` has to tolerate)
+    // must not abort this match arm before the mandatory ContinueDebugEvent
+    // call at the bottom of the loop runs, or the debug loop desyncs
+    // forever (see the CREATE_THREAD_DEBUG_EVENT handler for the same
+    // caveat in more detail).
+    fn take_watchpoint_hits(&mut self, thread_id: u32) -> Vec<usize> {
         if self.watchpoints.list().next().is_none() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let Some(proc) = self.process.as_ref() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let dr6 = proc.get_debug_registers(thread_id)?.Dr6;
+        let dr6 = match proc.get_debug_registers(thread_id) {
+            Ok(ctx) => ctx.Dr6,
+            Err(e) => {
+                eprintln!("Warning: could not read debug registers on thread {}: {}", thread_id, e);
+                return Vec::new();
+            }
+        };
         let mask = (dr6 & 0xF) as u8;
         if mask == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let hits = self.watchpoints.slots_hit(mask);
         let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
-        proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7)?;
-        Ok(hits)
+        if let Err(e) = proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7) {
+            eprintln!("Warning: could not clear debug registers on thread {}: {}", thread_id, e);
+        }
+        hits
     }
 
     // Prints old/new (or current) values for each hit watchpoint slot and
@@ -763,6 +798,166 @@ impl Debugger {
         if let Some(proc) = self.process.as_ref() {
             show_context(self.symbols.as_ref(), proc, stop_addr);
         }
+    }
+
+    // All Win32 debug events freeze the whole process until ContinueDebugEvent
+    // is called, so every known thread is genuinely halted here and safe to
+    // inspect regardless of which one raised the last event.
+    fn list_threads(&self) {
+        let Some(proc) = self.process.as_ref() else {
+            eprintln!("No process is running.");
+            return;
+        };
+        if self.threads.is_empty() {
+            println!("No threads.");
+            return;
+        }
+        let mut ids: Vec<u32> = self.threads.iter().copied().collect();
+        ids.sort();
+        for tid in ids {
+            let marker = if tid == self.last_thread_id { "*" } else { " " };
+            let main_tag = if tid == proc.main_thread_id { " (main)" } else { "" };
+            let lock_tag = if self.locked_thread == Some(tid) {
+                " (locked)"
+            } else if self.frozen_threads.contains(&tid) {
+                " (frozen)"
+            } else {
+                ""
+            };
+            match proc.get_thread_context_x64(tid) {
+                Ok(ctx) => {
+                    let rip = ctx.Rip as usize;
+                    println!(
+                        "{} {}{}{}  {:#x}{}",
+                        marker,
+                        tid,
+                        main_tag,
+                        lock_tag,
+                        rip,
+                        describe_address(self.symbols.as_ref(), rip)
+                    );
+                }
+                Err(_) => println!("{} {}{}{}  <context unavailable>", marker, tid, main_tag, lock_tag),
+            }
+        }
+    }
+
+    // Changes which thread subsequent regs/bt/list/print/show/step commands
+    // operate on. Doesn't touch execution state: the next continue/step still
+    // resumes the whole process, and the next debug event will move
+    // last_thread_id again regardless of this selection.
+    fn switch_thread(&mut self, id: u32) -> Result<()> {
+        let Some(proc) = self.process.as_ref() else {
+            eprintln!("No process is running.");
+            return Ok(());
+        };
+        if !self.threads.contains(&id) {
+            eprintln!("No such thread: {}", id);
+            return Ok(());
+        }
+        self.last_thread_id = id;
+        match proc.get_thread_context_x64(id) {
+            Ok(ctx) => {
+                let addr = ctx.Rip as usize;
+                println!(
+                    "Switched to thread {}: {:#x}{}",
+                    id,
+                    addr,
+                    describe_address(self.symbols.as_ref(), addr)
+                );
+            }
+            // Some threads (e.g. certain OS-internal worker threads) refuse
+            // GetThreadContext/SuspendThread even to the active debugger;
+            // the switch itself (which commands operate on) still succeeds.
+            Err(e) => println!("Switched to thread {} (context unavailable: {})", id, e),
+        }
+        Ok(())
+    }
+
+    // Freezes every known thread except `id` (the current thread if not
+    // given), so that only it actually runs on the next continue/step; the
+    // rest stay suspended even though ContinueDebugEvent lets the process
+    // as a whole proceed. Switching the lock to a different thread thaws
+    // the previous one and freezes the new one instead.
+    //
+    // Suspending/resuming is best-effort per thread: some threads (certain
+    // OS-internal worker threads) deny SUSPEND_RESUME access even to the
+    // active debugger, and one such thread must not stop `lock` from
+    // freezing every other thread it *can* reach.
+    fn lock_thread(&mut self, id: Option<u32>) -> Result<()> {
+        let Some(proc) = self.process.as_ref() else {
+            eprintln!("No process is running.");
+            return Ok(());
+        };
+        let target = id.unwrap_or(self.last_thread_id);
+        if !self.threads.contains(&target) {
+            eprintln!("No such thread: {}", target);
+            return Ok(());
+        }
+
+        match self.locked_thread {
+            Some(current) if current == target => {
+                eprintln!("Already locked to thread {}.", target);
+                return Ok(());
+            }
+            Some(current) => {
+                // Retarget: `target` was frozen and must be thawed;
+                // `current` now joins the freeze in its place. Threads that
+                // arrived after the original lock (never frozen, see
+                // frozen_threads's doc comment) are left exactly as they are.
+                if self.frozen_threads.remove(&target) {
+                    if let Err(e) = proc.resume_thread(target) {
+                        eprintln!("Warning: could not thaw thread {}: {}", target, e);
+                    }
+                }
+                match proc.suspend_thread(current) {
+                    Ok(()) => {
+                        self.frozen_threads.insert(current);
+                    }
+                    Err(e) => eprintln!("Warning: could not freeze thread {}: {}", current, e),
+                }
+            }
+            None => {
+                for &tid in &self.threads {
+                    if tid == target {
+                        continue;
+                    }
+                    match proc.suspend_thread(tid) {
+                        Ok(()) => {
+                            self.frozen_threads.insert(tid);
+                        }
+                        Err(e) => eprintln!("Warning: could not freeze thread {}: {}", tid, e),
+                    }
+                }
+            }
+        }
+
+        self.locked_thread = Some(target);
+        self.last_thread_id = target;
+        println!(
+            "Locked to thread {}; all other threads frozen until 'unlock'.",
+            target
+        );
+        Ok(())
+    }
+
+    fn unlock_thread(&mut self) -> Result<()> {
+        let Some(locked) = self.locked_thread.take() else {
+            eprintln!("Not locked to a thread.");
+            return Ok(());
+        };
+        if let Some(proc) = self.process.as_ref() {
+            for tid in self.frozen_threads.drain() {
+                // Best-effort: a frozen thread may have already exited or
+                // otherwise be unreachable; either way that's not a reason
+                // to skip thawing the rest.
+                let _ = proc.resume_thread(tid);
+            }
+        } else {
+            self.frozen_threads.clear();
+        }
+        println!("Unlocked thread {}; all threads resumed.", locked);
+        Ok(())
     }
 
     fn list_source(&mut self, target: Option<&str>) -> Result<()> {
@@ -980,7 +1175,7 @@ impl Debugger {
 
         let ok = match &loc {
             eval::Location::Memory(tl) => ctx.write_typed(*tl, value),
-            eval::Location::Register(name) => ctx.write_register(name, value.as_i64()),
+            eval::Location::Register(name) => ctx.write_register(name, value),
         };
 
         if ok {
@@ -1290,7 +1485,7 @@ impl Debugger {
                         // STATUS_SINGLE_STEP (both are INT1/#DB), so DR6 must
                         // be inspected to tell a watchpoint hit apart from
                         // one of this file's own single-instruction steps.
-                        let watch_hits = self.take_watchpoint_hits(event.dwThreadId)?;
+                        let watch_hits = self.take_watchpoint_hits(event.dwThreadId);
 
                         if let Some((hook_addr, kind)) = self.pending_leak_rearm.take() {
                             let proc = self.process.as_ref().unwrap();
@@ -1428,6 +1623,12 @@ impl Debugger {
                         event.u.ExitProcess.dwExitCode
                     });
                     self.running = false;
+                    // Without this, self.process stays Some after the
+                    // debuggee is fully gone, so a later `continue` would
+                    // pass every "is a process running?" guard and then
+                    // spin in wait_for_event forever, since a fully exited
+                    // process can never produce another debug event.
+                    self.shutdown()?;
                     return Ok(());
                 }
                 CREATE_THREAD_DEBUG_EVENT => {
@@ -1436,11 +1637,46 @@ impl Debugger {
                     // Debug registers are per-thread and start zeroed, so a
                     // new thread must be given the currently active
                     // watchpoints explicitly or it simply won't trap on them.
-                    self.apply_watchpoints_to_thread(event.dwThreadId)?;
+                    //
+                    // Must not use `?` here: some threads (certain
+                    // OS-internal worker threads) deny GetContext/SetContext
+                    // even to the active debugger, and propagating that
+                    // error would abort this match arm before the
+                    // mandatory ContinueDebugEvent call at the bottom of
+                    // the loop runs, permanently desyncing the debug loop
+                    // (the debuggee stays halted forever, since Windows
+                    // requires that call to acknowledge every debug event
+                    // before the process can run again).
+                    if let Err(e) = self.apply_watchpoints_to_thread(event.dwThreadId) {
+                        eprintln!(
+                            "Warning: could not sync watchpoints to thread {}: {}",
+                            event.dwThreadId, e
+                        );
+                    }
+                    // Deliberately NOT auto-frozen even while locked: see
+                    // frozen_threads's doc comment on the Debugger struct.
                 }
                 EXIT_THREAD_DEBUG_EVENT => {
                     println!("Thread exited: {}", event.dwThreadId);
                     self.threads.remove(&event.dwThreadId);
+                    self.frozen_threads.remove(&event.dwThreadId);
+                    if self.locked_thread == Some(event.dwThreadId) {
+                        // The thread `lock` was keeping everyone else frozen
+                        // for is gone: every other thread must be thawed
+                        // here, or they stay suspended forever with no
+                        // `unlock` able to reach them (locked_thread already
+                        // being cleared makes unlock_thread() a no-op).
+                        if let Some(proc) = self.process.as_ref() {
+                            for tid in self.frozen_threads.drain() {
+                                let _ = proc.resume_thread(tid);
+                            }
+                        }
+                        self.locked_thread = None;
+                        eprintln!(
+                            "Locked thread {} exited; lock released and other threads unfrozen.",
+                            event.dwThreadId
+                        );
+                    }
                 }
                 LOAD_DLL_DEBUG_EVENT => unsafe {
                     let info = event.u.LoadDll;
@@ -1606,13 +1842,19 @@ impl eval::EvalContext for DebugEvalContext<'_> {
         }))
     }
 
-    fn register(&self, name: &str) -> Option<i64> {
-        self.ctx.register(name)
+    fn register(&self, name: &str) -> Option<eval::Value> {
+        if let Some(f) = self.ctx.register_f64(name) {
+            return Some(eval::Value::Float(f));
+        }
+        self.ctx.register(name).map(eval::Value::Int)
     }
 
-    fn write_register(&self, name: &str, value: i64) -> bool {
+    fn write_register(&self, name: &str, value: eval::Value) -> bool {
         let mut ctx = self.ctx;
-        if !ctx.set_register(name, value) {
+        // Tries the float-valued registers (ST0-ST7) first, since those
+        // need `value`'s fractional part rather than truncated-to-i64.
+        let ok = ctx.set_register_f64(name, value.as_f64()) || ctx.set_register(name, value.as_i64());
+        if !ok {
             return false;
         }
         self.proc.set_thread_context_x64(self.thread_id, &ctx).is_ok()
@@ -2042,6 +2284,40 @@ fn print_context(ctx: &CONTEXT) {
     println!("R14: {:#018x}", ctx.R14);
     println!("R15: {:#018x}", ctx.R15);
     println!("EFLAGS: {:#010x}", ctx.EFlags);
+
+    // Only populated when CONTEXT_FLOATING_POINT was requested
+    // (get_full_thread_context_x64); a plain get_thread_context_x64 context
+    // would print all-zero garbage here.
+    let flt = unsafe { ctx.Anonymous.FltSave };
+    println!();
+    println!(
+        "MXCSR: {:#010x}  Control: {:#06x}  Status: {:#06x}  Tag: {:#04x}",
+        flt.MxCsr, flt.ControlWord, flt.StatusWord, flt.TagWord
+    );
+    // MM0-MM7 alias the low 64 bits (the mantissa field) of ST0-ST7, per the
+    // x87/MMX register aliasing defined by the Intel SDM.
+    for (i, reg) in flt.FloatRegisters.iter().enumerate() {
+        println!(
+            "ST{}: {:<width$}  MM{}: {:#018x}",
+            i,
+            format_x87_extended(reg.Low, reg.High as u64),
+            i,
+            reg.Low,
+            width = 24,
+        );
+    }
+    for (i, reg) in flt.XmmRegisters.iter().enumerate() {
+        println!("XMM{:<2}: {:016x}{:016x}", i, reg.High as u64, reg.Low);
+    }
+}
+
+// Decodes an 80-bit x87 extended-precision value (as stored in FXSAVE's
+// 16-byte-aligned FloatRegisters slots: a 64-bit mantissa in `low`, then a
+// 1-bit sign + 15-bit biased exponent in the low 16 bits of `high`) into an
+// f64 for display. This loses precision beyond f64's 52-bit mantissa, which
+// is an accepted trade-off for a register dump rather than exact arithmetic.
+fn format_x87_extended(mantissa: u64, high: u64) -> String {
+    format!("{}", process::decode_x87_extended(mantissa, high))
 }
 
 fn print_memory(mut base: usize, bytes: &[u8]) {
