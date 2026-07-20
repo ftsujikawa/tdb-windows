@@ -26,6 +26,9 @@ pub enum DebuggerError {
     #[error("Symbol not found: {0}")]
     SymbolNotFound(String),
 
+    #[error("No such process: {0}")]
+    NoSuchProcess(u32),
+
     #[error("{0}")]
     Other(String),
 }

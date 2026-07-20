@@ -1,8 +1,13 @@
-use crate::error::Result;
+use crate::error::{DebuggerError, Result};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use windows::Win32::Foundation::{CloseHandle, BOOL, ERROR_SEM_TIMEOUT, HANDLE, NTSTATUS};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
+    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
 use windows::Win32::System::Console::{
     GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
 };
@@ -14,9 +19,9 @@ use windows::Win32::System::Memory::{
     VirtualProtectEx, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, IsWow64Process, OpenThread, ResumeThread, SuspendThread, TerminateProcess,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW, THREAD_ACCESS_RIGHTS,
-    THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+    CreateProcessW, GetCurrentProcess, IsWow64Process, OpenProcessToken, OpenThread, ResumeThread,
+    SuspendThread, TerminateProcess, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    THREAD_ACCESS_RIGHTS, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
 };
 
 const INT3: u8 = 0xCC;
@@ -26,7 +31,11 @@ const CONTEXT_CONTROL_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x00100001);
 // can reference any non-volatile GPR (Rbp, Rbx, R12-R15, ...).
 const CONTEXT_FULL_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x0010000B);
 const CONTEXT_DEBUG_REGISTERS_X64: CONTEXT_FLAGS = CONTEXT_FLAGS(0x00100010);
-const DEBUG_ONLY_THIS_PROCESS: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x00000002);
+// DEBUG_PROCESS (rather than DEBUG_ONLY_THIS_PROCESS) so that any child
+// process the debuggee later creates is debugged too, instead of running
+// completely outside tdb's control: Windows delivers CREATE_PROCESS/
+// CREATE_THREAD/EXIT_* debug events for the whole process tree.
+const DEBUG_PROCESS: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x00000001);
 // Puts the debuggee in its own process group (while still sharing our
 // console) so GenerateConsoleCtrlEvent can target it specifically without
 // also hitting the debugger itself.
@@ -57,6 +66,47 @@ pub fn install_interrupt_handler() -> Result<()> {
         SetConsoleCtrlHandler(Some(console_ctrl_handler), true)?;
     }
     Ok(())
+}
+
+// Enables SeDebugPrivilege in this process's own token, best-effort. Without
+// it, OpenThread (thread_handle() below) is denied ERROR_ACCESS_DENIED for
+// some threads even though this process is the active debugger of theirs:
+// being the debugger only grants the implicit right to receive/continue
+// debug events, not to freely OpenProcess/OpenThread them, which still goes
+// through the normal DACL check unless the caller holds SeDebugPrivilege
+// (as real debuggers like WinDbg enable at startup). Silently does nothing
+// if the privilege isn't available to this token (e.g. not running
+// elevated) or any step fails; callers just keep tolerating the occasional
+// access-denied warning as before.
+pub fn enable_debug_privilege() {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let mut priv_value = Default::default();
+        if LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut priv_value).is_err() {
+            let _ = CloseHandle(token);
+            return;
+        }
+
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: priv_value,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let _ = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        let _ = CloseHandle(token);
+    }
 }
 
 // True at most once per Ctrl+C/Ctrl+Break (the flag is cleared on read), so
@@ -282,13 +332,20 @@ pub fn encode_x87_extended(value: f64) -> (u64, i64) {
     (mantissa_ext, ((sign << 15) | (exponent_ext & 0x7fff)) as i64)
 }
 
-pub struct DebuggeeProcess {
-    pub pid: u32,
-    pub handle: HANDLE,
-    pub main_thread_id: u32,
-    pub main_thread: HANDLE,
+// One tracked process: the root (originally launched) process, or a child
+// it later spawned via CreateProcess and that Windows is now also reporting
+// debug events for (see DEBUG_PROCESS above).
+struct ProcessEntry {
+    handle: HANDLE,
+    main_thread: HANDLE,
+    main_thread_id: u32,
     #[allow(dead_code)]
-    pub is64bit: bool,
+    is64bit: bool,
+}
+
+pub struct DebuggeeProcess {
+    pub root_pid: u32,
+    processes: HashMap<u32, ProcessEntry>,
 }
 
 impl DebuggeeProcess {
@@ -310,7 +367,7 @@ impl DebuggeeProcess {
                 None,
                 None,
                 false,
-                PROCESS_CREATION_FLAGS(DEBUG_ONLY_THIS_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0),
+                PROCESS_CREATION_FLAGS(DEBUG_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0),
                 None,
                 None,
                 &si,
@@ -321,13 +378,78 @@ impl DebuggeeProcess {
         let is64bit = unsafe { is_wow64_process(pi.hProcess)? };
         DEBUGGEE_PID.store(pi.dwProcessId, Ordering::SeqCst);
 
+        let mut processes = HashMap::new();
+        processes.insert(
+            pi.dwProcessId,
+            ProcessEntry {
+                handle: pi.hProcess,
+                main_thread: pi.hThread,
+                main_thread_id: pi.dwThreadId,
+                is64bit,
+            },
+        );
+
         Ok(Self {
-            pid: pi.dwProcessId,
-            handle: pi.hProcess,
-            main_thread_id: pi.dwThreadId,
-            main_thread: pi.hThread,
-            is64bit,
+            root_pid: pi.dwProcessId,
+            processes,
         })
+    }
+
+    pub fn root_handle(&self) -> Result<HANDLE> {
+        self.handle_for(self.root_pid)
+    }
+
+    pub fn root_main_thread_id(&self) -> u32 {
+        self.processes
+            .get(&self.root_pid)
+            .map(|p| p.main_thread_id)
+            .unwrap_or(0)
+    }
+
+    // Called from CREATE_PROCESS_DEBUG_EVENT for a genuine child process
+    // (the root's own such event is already covered by launch() above).
+    // Bitness detection is best-effort: a process this debugger isn't
+    // allowed to query for (rare) still gets tracked, just without that bit
+    // recorded, since nothing here treats is64bit as anything but informational.
+    pub fn register_process(&mut self, pid: u32, handle: HANDLE, main_thread: HANDLE, main_thread_id: u32) {
+        let is64bit = unsafe { is_wow64_process(handle) }.unwrap_or(false);
+        self.processes.insert(
+            pid,
+            ProcessEntry {
+                handle,
+                main_thread,
+                main_thread_id,
+                is64bit,
+            },
+        );
+    }
+
+    // Called from EXIT_PROCESS_DEBUG_EVENT once a (root or child) process is
+    // gone, so its handle isn't leaked and later lookups correctly report it
+    // as no longer tracked.
+    pub fn remove_process(&mut self, pid: u32) {
+        if let Some(entry) = self.processes.remove(&pid) {
+            unsafe {
+                let _ = CloseHandle(entry.handle);
+                let _ = CloseHandle(entry.main_thread);
+            }
+        }
+    }
+
+    // (pid, main_thread_id, is_root) for every currently tracked process,
+    // backing the `processes` REPL command.
+    pub fn list_processes(&self) -> Vec<(u32, u32, bool)> {
+        self.processes
+            .iter()
+            .map(|(&pid, entry)| (pid, entry.main_thread_id, pid == self.root_pid))
+            .collect()
+    }
+
+    fn handle_for(&self, pid: u32) -> Result<HANDLE> {
+        self.processes
+            .get(&pid)
+            .map(|entry| entry.handle)
+            .ok_or(DebuggerError::NoSuchProcess(pid))
     }
 
     // Forwards a Ctrl+C to the debuggee, the closest Windows equivalent of
@@ -336,7 +458,7 @@ impl DebuggeeProcess {
     // without also hitting the debugger.
     pub fn interrupt(&self) -> Result<()> {
         unsafe {
-            GenerateConsoleCtrlEvent(CTRL_C_EVENT, self.pid)?;
+            GenerateConsoleCtrlEvent(CTRL_C_EVENT, self.root_pid)?;
         }
         Ok(())
     }
@@ -362,11 +484,12 @@ impl DebuggeeProcess {
         Ok(())
     }
 
-    pub fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize> {
+    pub fn read_memory(&self, pid: u32, address: usize, buf: &mut [u8]) -> Result<usize> {
+        let handle = self.handle_for(pid)?;
         let mut read = 0usize;
         unsafe {
             ReadProcessMemory(
-                self.handle,
+                handle,
                 address as *const _,
                 buf.as_mut_ptr() as *mut _,
                 buf.len(),
@@ -376,11 +499,12 @@ impl DebuggeeProcess {
         Ok(read)
     }
 
-    pub fn write_memory(&self, address: usize, data: &[u8]) -> Result<usize> {
+    pub fn write_memory(&self, pid: u32, address: usize, data: &[u8]) -> Result<usize> {
+        let handle = self.handle_for(pid)?;
         let mut written = 0usize;
         unsafe {
             WriteProcessMemory(
-                self.handle,
+                handle,
                 address as *const _,
                 data.as_ptr() as *const _,
                 data.len(),
@@ -390,16 +514,17 @@ impl DebuggeeProcess {
         Ok(written)
     }
 
-    pub fn set_breakpoint(&self, address: usize) -> Result<u8> {
+    pub fn set_breakpoint(&self, pid: u32, address: usize) -> Result<u8> {
+        let handle = self.handle_for(pid)?;
         let mut old_byte = 0u8;
-        self.read_memory(address, unsafe {
+        self.read_memory(pid, address, unsafe {
             std::slice::from_raw_parts_mut(&mut old_byte, 1)
         })?;
 
         let mut old_protect = PAGE_PROTECTION_FLAGS(0);
         unsafe {
             VirtualProtectEx(
-                self.handle,
+                handle,
                 address as *const _,
                 1,
                 PAGE_EXECUTE_READWRITE,
@@ -410,7 +535,7 @@ impl DebuggeeProcess {
         let mut written = 0usize;
         unsafe {
             WriteProcessMemory(
-                self.handle,
+                handle,
                 address as *const _,
                 &INT3 as *const _ as *const _,
                 1,
@@ -420,7 +545,7 @@ impl DebuggeeProcess {
 
         unsafe {
             VirtualProtectEx(
-                self.handle,
+                handle,
                 address as *const _,
                 1,
                 old_protect,
@@ -431,11 +556,12 @@ impl DebuggeeProcess {
         Ok(old_byte)
     }
 
-    pub fn remove_breakpoint(&self, address: usize, original_byte: u8) -> Result<()> {
+    pub fn remove_breakpoint(&self, pid: u32, address: usize, original_byte: u8) -> Result<()> {
+        let handle = self.handle_for(pid)?;
         let mut old_protect = PAGE_PROTECTION_FLAGS(0);
         unsafe {
             VirtualProtectEx(
-                self.handle,
+                handle,
                 address as *const _,
                 1,
                 PAGE_EXECUTE_READWRITE,
@@ -446,7 +572,7 @@ impl DebuggeeProcess {
         let mut written = 0usize;
         unsafe {
             WriteProcessMemory(
-                self.handle,
+                handle,
                 address as *const _,
                 &original_byte as *const _ as *const _,
                 1,
@@ -456,7 +582,7 @@ impl DebuggeeProcess {
 
         unsafe {
             VirtualProtectEx(
-                self.handle,
+                handle,
                 address as *const _,
                 1,
                 old_protect,
@@ -580,11 +706,19 @@ impl Drop for DebuggeeProcess {
     fn drop(&mut self) {
         // Only clear if we're still the current debuggee: a stale drop
         // racing a newer launch() must not clobber the new pid.
-        let _ = DEBUGGEE_PID.compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
-        unsafe {
-            let _ = TerminateProcess(self.handle, 0);
-            let _ = CloseHandle(self.handle);
-            let _ = CloseHandle(self.main_thread);
+        let _ = DEBUGGEE_PID.compare_exchange(self.root_pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        for (_, entry) in self.processes.drain() {
+            unsafe {
+                // Only the root process needs an explicit terminate: killing
+                // it takes any surviving child/grandchild debuggees down
+                // with it (they were all launched under it), and terminating
+                // a process that's already gone (a child that exited on its
+                // own, already removed via remove_process but possibly still
+                // present here on abnormal shutdown) is harmless either way.
+                let _ = TerminateProcess(entry.handle, 0);
+                let _ = CloseHandle(entry.handle);
+                let _ = CloseHandle(entry.main_thread);
+            }
         }
     }
 }

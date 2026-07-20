@@ -40,6 +40,7 @@ pub enum Command {
     ListWatchpoints,
     Threads,
     Thread(u32),
+    Processes,
     Lock(Option<u32>),
     Unlock,
     Registers,
@@ -135,6 +136,7 @@ pub fn parse(input: &str) -> Result<Command> {
         }
         "wl" | "watchpoints" => Ok(Command::ListWatchpoints),
         "threads" => Ok(Command::Threads),
+        "ps" | "processes" => Ok(Command::Processes),
         "thread" => {
             if args.is_empty() {
                 return Err(DebuggerError::InvalidCommand(
@@ -346,6 +348,7 @@ pub fn help_text() -> &'static str {
                                 OS/CRT one like the heap lock touched by
                                 malloc/printf), continuing can hang forever.
   unlock                       Resume all threads frozen by 'lock'
+  ps, processes                List tracked processes (root + child processes)
   l, list [addr|symbol|file:line]  Show source (current position if omitted)
   regs, registers              Show registers
   x, memory <addr> [count]     Dump memory

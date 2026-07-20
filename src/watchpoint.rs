@@ -35,6 +35,7 @@ impl WatchKind {
 #[derive(Debug, Clone)]
 pub struct Watchpoint {
     pub id: usize,
+    pub pid: u32,
     pub expr: String,
     pub address: usize,
     pub size: u32,
@@ -82,6 +83,7 @@ impl WatchpointManager {
     // four are already in use.
     pub fn add(
         &mut self,
+        pid: u32,
         expr: String,
         address: usize,
         size: u32,
@@ -93,6 +95,7 @@ impl WatchpointManager {
         let id = self.next_id;
         self.slots[slot] = Some(Watchpoint {
             id,
+            pid,
             expr,
             address,
             size,
@@ -129,14 +132,19 @@ impl WatchpointManager {
             .collect()
     }
 
-    // The DR0-DR3/DR7 values a thread's debug registers should hold to
-    // reflect the currently active watchpoints. Empty slots leave their DRi
-    // at 0 and their DR7 enable bit clear.
-    pub fn dr7_and_addrs(&self) -> (u64, u64, u64, u64, u64) {
+    // The DR0-DR3/DR7 values a thread belonging to `pid` should hold to
+    // reflect the currently active watchpoints: slots that watch a
+    // *different* process's address space are left disabled (DRi at 0, DR7
+    // enable bit clear), since a watchpoint's address is only meaningful
+    // within the process it was set on.
+    pub fn dr7_and_addrs_for_pid(&self, pid: u32) -> (u64, u64, u64, u64, u64) {
         let mut dr = [0u64; 4];
         let mut dr7 = 0u64;
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(wp) = slot {
+                if wp.pid != pid {
+                    continue;
+                }
                 dr[i] = wp.address as u64;
                 dr7 |= 1 << (i * 2); // local enable (Li)
                 dr7 |= wp.kind.condition_bits() << (16 + i * 4);

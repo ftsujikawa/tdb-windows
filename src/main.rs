@@ -30,6 +30,10 @@ fn main() -> Result<()> {
     // (default console behavior); this lets us forward it to the debuggee
     // instead (see process::interrupt).
     process::install_interrupt_handler()?;
+    // Best-effort: lets OpenThread reach threads that would otherwise deny
+    // GetContext/SetContext even to the active debugger (see the function
+    // doc comment). Requires running elevated to have any effect.
+    process::enable_debug_privilege();
 
     let target = args.target.join(" ");
     let mut debugger = Debugger::new(target);

@@ -8,7 +8,7 @@ use crate::process::{AlignedContext, DebuggeeProcess};
 use crate::symbols;
 use crate::symbols::SymbolResolver;
 use crate::watchpoint::{self, WatchKind, WatchpointManager};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT, CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT,
@@ -83,11 +83,12 @@ pub struct Debugger {
     process: Option<DebuggeeProcess>,
     breakpoints: BreakpointManager,
     watchpoints: WatchpointManager,
-    // Thread ids seen via CREATE_PROCESS/CREATE_THREAD debug events, tracked
+    // Thread ids seen via CREATE_PROCESS/CREATE_THREAD debug events, mapped
+    // to the pid that owns them (root or a debugged child process). Tracked
     // so a new watchpoint can be pushed to every live thread (debug
     // registers are per-thread) and a newly created thread can pick up
     // whatever watchpoints are already active.
-    threads: HashSet<u32>,
+    threads: HashMap<u32, u32>,
     // Set by `lock`: the one thread allowed to run.
     locked_thread: Option<u32>,
     // The threads actually holding an extra SuspendThread from `lock`, on
@@ -121,7 +122,7 @@ impl Debugger {
             process: None,
             breakpoints: BreakpointManager::new(),
             watchpoints: WatchpointManager::new(),
-            threads: HashSet::new(),
+            threads: HashMap::new(),
             locked_thread: None,
             frozen_threads: HashSet::new(),
             symbols: None,
@@ -193,7 +194,7 @@ impl Debugger {
             Command::Delete(id) => {
                 if let Some(bp) = self.breakpoints.remove_by_id(id) {
                     if let Some(proc) = self.process.as_ref() {
-                        proc.remove_breakpoint(bp.address, bp.original_byte)?;
+                        proc.remove_breakpoint(bp.pid, bp.address, bp.original_byte)?;
                     }
                     println!(
                         "Deleted breakpoint #{} at {:#x}{}",
@@ -210,6 +211,7 @@ impl Debugger {
             Command::ListWatchpoints => self.list_watchpoints(),
             Command::Threads => self.list_threads(),
             Command::Thread(id) => self.switch_thread(id)?,
+            Command::Processes => self.list_processes(),
             Command::Lock(id) => self.lock_thread(id)?,
             Command::Unlock => self.unlock_thread()?,
             Command::ListBreakpoints => {
@@ -217,9 +219,10 @@ impl Debugger {
                 list.sort_by_key(|bp| bp.id);
                 for bp in list {
                     println!(
-                        "#{} {:#x}: {}{}",
+                        "#{} {:#x} (pid {}): {}{}",
                         bp.id,
                         bp.address,
+                        bp.pid,
                         if bp.enabled { "enabled" } else { "disabled" },
                         describe_address(self.symbols.as_ref(), bp.address)
                     );
@@ -263,7 +266,7 @@ impl Debugger {
 
         println!("Starting: {}", self.target_path);
         let proc = DebuggeeProcess::launch(&self.target_path)?;
-        let handle = proc.handle;
+        let handle = proc.root_handle()?;
         self.symbols = Some(SymbolResolver::new(handle, None)?);
         self.process = Some(proc);
         self.running = false;
@@ -333,7 +336,11 @@ impl Debugger {
             match symbols.resolve_function_entry(name) {
                 Ok(addr) => {
                     let addr = addr as usize;
-                    match proc.set_breakpoint(addr) {
+                    // Leak-hook addresses are always resolved through the
+                    // root process's symbols, so the hook itself must always
+                    // be planted there too, regardless of which thread the
+                    // user has currently selected via `thread`.
+                    match proc.set_breakpoint(proc.root_pid, addr) {
                         Ok(original) => {
                             self.leak_hooks.insert(addr, (kind, original));
                             installed += 1;
@@ -365,7 +372,7 @@ impl Debugger {
     fn stop_leak_tracking(&mut self) -> Result<()> {
         if let Some(proc) = self.process.as_ref() {
             for (addr, (_, original_byte)) in self.leak_hooks.drain() {
-                let _ = proc.remove_breakpoint(addr, original_byte);
+                let _ = proc.remove_breakpoint(proc.root_pid, addr, original_byte);
             }
         } else {
             self.leak_hooks.clear();
@@ -423,9 +430,10 @@ impl Debugger {
             return Ok(());
         };
         let return_addr = return_addr as usize;
+        let pid = self.current_pid();
 
-        if !self.breakpoints.contains(return_addr) {
-            let original = proc.set_breakpoint(return_addr)?;
+        if !self.breakpoints.contains(pid, return_addr) {
+            let original = proc.set_breakpoint(pid, return_addr)?;
             self.finish_bp = Some((return_addr, original));
         }
 
@@ -489,20 +497,21 @@ impl Debugger {
         };
         let over = target.over;
         let thread_id = self.last_thread_id;
+        let pid = self.current_pid();
 
         let proc = self.process.as_ref().unwrap();
         let rip = proc.get_thread_context_x64(thread_id)?.Rip;
 
         let decoded = {
             let mut buf = [0u8; 16];
-            let read = proc.read_memory(rip as usize, &mut buf).unwrap_or(0);
+            let read = proc.read_memory(pid, rip as usize, &mut buf).unwrap_or(0);
             crate::disasm::decode_one(&buf[..read], rip)
         };
 
         if over && decoded.as_ref().is_some_and(|d| d.is_call) {
             let return_addr = (rip + decoded.unwrap().length as u64) as usize;
-            if !self.breakpoints.contains(return_addr) {
-                let original = proc.set_breakpoint(return_addr)?;
+            if !self.breakpoints.contains(pid, return_addr) {
+                let original = proc.set_breakpoint(pid, return_addr)?;
                 self.step_over_bp = Some((return_addr, original));
             }
         } else {
@@ -530,24 +539,33 @@ impl Debugger {
     }
 
     // Resolves a breakpoint/list target ("0x1234", "1234", "add", "test.c:4")
-    // to an address. Returns Ok(None) when it already reported why it
-    // couldn't (no symbols/process yet), matching this file's habit of
-    // reporting via eprintln! and returning Ok(()) rather than an Err.
-    fn resolve_target_address(&self, target: &str) -> Result<Option<usize>> {
+    // to a (pid, address) pair. Returns Ok(None) when it already reported
+    // why it couldn't (no symbols/process yet), matching this file's habit
+    // of reporting via eprintln! and returning Ok(()) rather than an Err.
+    //
+    // Symbol/file:line targets only ever resolve against the root process's
+    // symbols (see the module-level scoping note on `self.symbols`), so
+    // those always report `proc.root_pid`; a raw address is assumed to
+    // belong to whichever process is currently selected (via `thread`).
+    fn resolve_target_address(&self, target: &str) -> Result<Option<(u32, usize)>> {
         let is_address = target.starts_with("0x")
             || target.starts_with("0X")
             || target.chars().all(|c| c.is_ascii_digit());
+        let Some(proc) = self.process.as_ref() else {
+            eprintln!("No process is running. Use 'run' first.");
+            return Ok(None);
+        };
 
         if let Some((file, line)) = parse_file_line(target) {
             let Some(symbols) = self.symbols.as_ref() else {
                 eprintln!("No symbols loaded. Use 'run' first.");
                 return Ok(None);
             };
-            Ok(Some(symbols.resolve_by_file_line(file, line)? as usize))
+            Ok(Some((proc.root_pid, symbols.resolve_by_file_line(file, line)? as usize)))
         } else if is_address {
-            Ok(Some(commands::parse_address(target)?))
+            Ok(Some((self.current_pid(), commands::parse_address(target)?)))
         } else if let Some(symbols) = self.symbols.as_ref() {
-            Ok(Some(symbols.resolve_function_entry(target)? as usize))
+            Ok(Some((proc.root_pid, symbols.resolve_function_entry(target)? as usize)))
         } else {
             eprintln!("No symbols loaded. Use 'run' first.");
             Ok(None)
@@ -555,18 +573,19 @@ impl Debugger {
     }
 
     fn set_breakpoint(&mut self, target: &str) -> Result<()> {
-        let Some(address) = self.resolve_target_address(target)? else {
+        let Some((pid, address)) = self.resolve_target_address(target)? else {
             return Ok(());
         };
 
         if let Some(proc) = self.process.as_ref() {
-            let original = proc.set_breakpoint(address)?;
-            let id = self.breakpoints.add(address, original);
+            let original = proc.set_breakpoint(pid, address)?;
+            let id = self.breakpoints.add(pid, address, original);
             println!(
-                "Breakpoint #{} set at {:#x}{}",
+                "Breakpoint #{} set at {:#x}{} (pid {})",
                 id,
                 address,
-                describe_address(self.symbols.as_ref(), address)
+                describe_address(self.symbols.as_ref(), address),
+                pid
             );
         } else {
             eprintln!("No process is running. Use 'run' first.");
@@ -592,7 +611,7 @@ impl Debugger {
 
         // Scoped so the borrow of `self` inside `ctx` ends before this
         // function needs to mutate `self.watchpoints` below.
-        let (address, size, initial_value) = {
+        let (pid, address, size, initial_value) = {
             let Some(ctx) = self.make_eval_context()? else {
                 return Ok(());
             };
@@ -616,12 +635,12 @@ impl Debugger {
                 return Ok(());
             };
             let initial_value = eval::eval(&expr, &ctx).ok().map(|v| v.as_i64());
-            (tl.address as usize, size, initial_value)
+            (ctx.pid, tl.address as usize, size, initial_value)
         };
 
         match self
             .watchpoints
-            .add(raw.trim().to_string(), address, size, kind, initial_value)
+            .add(pid, raw.trim().to_string(), address, size, kind, initial_value)
         {
             Some(id) => {
                 self.sync_watchpoints_to_threads()?;
@@ -660,9 +679,10 @@ impl Debugger {
         }
         for w in list {
             println!(
-                "#{} {:#x} ({} byte{}, {}): '{}'",
+                "#{} {:#x} (pid {}, {} byte{}, {}): '{}'",
                 w.id,
                 w.address,
+                w.pid,
                 w.size,
                 if w.size == 1 { "" } else { "s" },
                 w.kind,
@@ -678,18 +698,21 @@ impl Debugger {
         let Some(proc) = self.process.as_ref() else {
             return Ok(());
         };
-        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
-        for &tid in &self.threads {
+        // Each thread only gets the watchpoints that belong to its own
+        // process: a watchpoint's address is meaningless in any other
+        // process's address space.
+        for (&tid, &pid) in &self.threads {
+            let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs_for_pid(pid);
             proc.set_debug_registers(tid, dr0, dr1, dr2, dr3, dr7)?;
         }
         Ok(())
     }
 
-    fn apply_watchpoints_to_thread(&self, thread_id: u32) -> Result<()> {
+    fn apply_watchpoints_to_thread(&self, pid: u32, thread_id: u32) -> Result<()> {
         let Some(proc) = self.process.as_ref() else {
             return Ok(());
         };
-        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
+        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs_for_pid(pid);
         proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7)
     }
 
@@ -723,7 +746,8 @@ impl Debugger {
             return Vec::new();
         }
         let hits = self.watchpoints.slots_hit(mask);
-        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs();
+        let pid = self.thread_pid(thread_id).unwrap_or(0);
+        let (dr0, dr1, dr2, dr3, dr7) = self.watchpoints.dr7_and_addrs_for_pid(pid);
         if let Err(e) = proc.set_debug_registers(thread_id, dr0, dr1, dr2, dr3, dr7) {
             eprintln!("Warning: could not clear debug registers on thread {}: {}", thread_id, e);
         }
@@ -743,6 +767,7 @@ impl Debugger {
             proc,
             symbols: self.symbols.as_ref(),
             thread_id: self.last_thread_id,
+            pid: self.current_pid(),
             ctx,
         };
 
@@ -796,8 +821,22 @@ impl Debugger {
             describe_address(self.symbols.as_ref(), stop_addr)
         );
         if let Some(proc) = self.process.as_ref() {
-            show_context(self.symbols.as_ref(), proc, stop_addr);
+            show_context(self.symbols.as_ref(), proc, self.current_pid(), stop_addr);
         }
+    }
+
+    fn thread_pid(&self, tid: u32) -> Option<u32> {
+        self.threads.get(&tid).copied()
+    }
+
+    // The process that `break`/`watch`/memory/eval commands operate on when
+    // no process is named explicitly: whichever process owns the currently
+    // selected thread (`thread <id>` moves this), falling back to the root
+    // process before any thread has been selected yet.
+    fn current_pid(&self) -> u32 {
+        self.thread_pid(self.last_thread_id)
+            .or_else(|| self.process.as_ref().map(|p| p.root_pid))
+            .unwrap_or(0)
     }
 
     // All Win32 debug events freeze the whole process until ContinueDebugEvent
@@ -812,11 +851,16 @@ impl Debugger {
             println!("No threads.");
             return;
         }
-        let mut ids: Vec<u32> = self.threads.iter().copied().collect();
+        let main_thread_ids: HashSet<u32> = proc
+            .list_processes()
+            .into_iter()
+            .map(|(_, main_tid, _)| main_tid)
+            .collect();
+        let mut ids: Vec<(u32, u32)> = self.threads.iter().map(|(&tid, &pid)| (tid, pid)).collect();
         ids.sort();
-        for tid in ids {
+        for (tid, pid) in ids {
             let marker = if tid == self.last_thread_id { "*" } else { " " };
-            let main_tag = if tid == proc.main_thread_id { " (main)" } else { "" };
+            let main_tag = if main_thread_ids.contains(&tid) { " (main)" } else { "" };
             let lock_tag = if self.locked_thread == Some(tid) {
                 " (locked)"
             } else if self.frozen_threads.contains(&tid) {
@@ -828,17 +872,38 @@ impl Debugger {
                 Ok(ctx) => {
                     let rip = ctx.Rip as usize;
                     println!(
-                        "{} {}{}{}  {:#x}{}",
+                        "{} {} (pid {}){}{}  {:#x}{}",
                         marker,
                         tid,
+                        pid,
                         main_tag,
                         lock_tag,
                         rip,
                         describe_address(self.symbols.as_ref(), rip)
                     );
                 }
-                Err(_) => println!("{} {}{}{}  <context unavailable>", marker, tid, main_tag, lock_tag),
+                Err(_) => println!(
+                    "{} {} (pid {}){}{}  <context unavailable>",
+                    marker, tid, pid, main_tag, lock_tag
+                ),
             }
+        }
+    }
+
+    fn list_processes(&self) {
+        let Some(proc) = self.process.as_ref() else {
+            eprintln!("No process is running.");
+            return;
+        };
+        let mut processes = proc.list_processes();
+        processes.sort_by_key(|&(pid, _, _)| pid);
+        for (pid, main_thread_id, is_root) in processes {
+            println!(
+                "{}{}  main thread {}",
+                pid,
+                if is_root { " (root)" } else { " (child)" },
+                main_thread_id
+            );
         }
     }
 
@@ -851,7 +916,7 @@ impl Debugger {
             eprintln!("No process is running.");
             return Ok(());
         };
-        if !self.threads.contains(&id) {
+        if !self.threads.contains_key(&id) {
             eprintln!("No such thread: {}", id);
             return Ok(());
         }
@@ -890,7 +955,7 @@ impl Debugger {
             return Ok(());
         };
         let target = id.unwrap_or(self.last_thread_id);
-        if !self.threads.contains(&target) {
+        if !self.threads.contains_key(&target) {
             eprintln!("No such thread: {}", target);
             return Ok(());
         }
@@ -918,7 +983,7 @@ impl Debugger {
                 }
             }
             None => {
-                for &tid in &self.threads {
+                for &tid in self.threads.keys() {
                     if tid == target {
                         continue;
                     }
@@ -966,19 +1031,22 @@ impl Debugger {
             return Ok(());
         }
 
-        let address = match target {
+        let (pid, address) = match target {
             Some(target) => match self.resolve_target_address(target)? {
-                Some(address) => address,
+                Some(resolved) => resolved,
                 None => return Ok(()),
             },
             None => {
                 let proc = self.process.as_ref().unwrap();
-                proc.get_thread_context_x64(self.last_thread_id)?.Rip as usize
+                (
+                    self.current_pid(),
+                    proc.get_thread_context_x64(self.last_thread_id)?.Rip as usize,
+                )
             }
         };
 
         let proc = self.process.as_ref().unwrap();
-        show_context_with_window(self.symbols.as_ref(), proc, address, 5, 5);
+        show_context_with_window(self.symbols.as_ref(), proc, pid, address, 5, 5);
         Ok(())
     }
 
@@ -992,6 +1060,7 @@ impl Debugger {
             proc,
             symbols: self.symbols.as_ref(),
             thread_id: self.last_thread_id,
+            pid: self.current_pid(),
             ctx,
         }))
     }
@@ -1102,7 +1171,7 @@ impl Debugger {
             return Err("No process is running.".to_string());
         };
         let max_len = self.print_settings.elements.min(4096).max(1);
-        match read_c_string(proc, address, max_len) {
+        match read_c_string(proc, ctx.pid, address, max_len) {
             Some(s) => Ok(format!("{:#x} \"{}\"", address, escape_c_string(&s))),
             None => Ok(format!("{:#x} <unreadable string>", address)),
         }
@@ -1263,7 +1332,7 @@ impl Debugger {
         let address = commands::parse_address(address_str)?;
         if let Some(proc) = self.process.as_ref() {
             let mut buf = vec![0u8; count];
-            let read = proc.read_memory(address, &mut buf)?;
+            let read = proc.read_memory(self.current_pid(), address, &mut buf)?;
             print_memory(address, &buf[..read]);
         } else {
             eprintln!("No process is running.");
@@ -1297,6 +1366,11 @@ impl Debugger {
             };
             self.last_event = Some(event);
             self.last_thread_id = event.dwThreadId;
+            // The process that raised this event: always authoritative,
+            // unlike current_pid() which depends on self.threads already
+            // having this thread registered (not yet true for a process's
+            // very first event, handled below in CREATE_PROCESS_DEBUG_EVENT).
+            let pid = event.dwProcessId;
 
             match event.dwDebugEventCode {
                 EXCEPTION_DEBUG_EVENT => {
@@ -1308,7 +1382,7 @@ impl Debugger {
                         if let Some(pending) = self.pending_leak {
                             if address == pending.return_addr {
                                 let proc = self.process.as_ref().unwrap();
-                                proc.remove_breakpoint(pending.return_addr, pending.return_original_byte)?;
+                                proc.remove_breakpoint(pid, pending.return_addr, pending.return_original_byte)?;
                                 proc.set_rip(event.dwThreadId, pending.return_addr as u64)?;
 
                                 if matches!(pending.kind, LeakHookKind::Malloc | LeakHookKind::Calloc) {
@@ -1322,7 +1396,7 @@ impl Debugger {
                                     }
                                 }
 
-                                let new_byte = proc.set_breakpoint(pending.hook_addr)?;
+                                let new_byte = proc.set_breakpoint(pid, pending.hook_addr)?;
                                 self.leak_hooks.insert(pending.hook_addr, (pending.kind, new_byte));
                                 self.pending_leak = None;
                                 proc.continue_event(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)?;
@@ -1332,7 +1406,7 @@ impl Debugger {
 
                         if let Some(&(kind, original_byte)) = self.leak_hooks.get(&address) {
                             let proc = self.process.as_ref().unwrap();
-                            proc.remove_breakpoint(address, original_byte)?;
+                            proc.remove_breakpoint(pid, address, original_byte)?;
                             proc.set_rip(event.dwThreadId, address as u64)?;
 
                             let full_ctx = proc.get_full_thread_context_x64(event.dwThreadId)?;
@@ -1371,7 +1445,7 @@ impl Debugger {
                             match return_addr {
                                 Some(return_addr) => {
                                     let return_addr = return_addr as usize;
-                                    let return_original_byte = proc.set_breakpoint(return_addr)?;
+                                    let return_original_byte = proc.set_breakpoint(pid, return_addr)?;
                                     self.pending_leak = Some(PendingLeak {
                                         kind,
                                         arg,
@@ -1400,7 +1474,7 @@ impl Debugger {
                         if let Some((bp_addr, original_byte)) = self.finish_bp {
                             if address == bp_addr {
                                 let proc = self.process.as_ref().unwrap();
-                                proc.remove_breakpoint(bp_addr, original_byte)?;
+                                proc.remove_breakpoint(pid, bp_addr, original_byte)?;
                                 proc.set_rip(event.dwThreadId, bp_addr as u64)?;
                                 self.finish_bp = None;
 
@@ -1410,7 +1484,7 @@ impl Debugger {
                                     describe_address(self.symbols.as_ref(), bp_addr)
                                 );
                                 if let Some(proc) = self.process.as_ref() {
-                                    show_context(self.symbols.as_ref(), proc, bp_addr);
+                                    show_context(self.symbols.as_ref(), proc, pid, bp_addr);
                                 }
                                 self.running = false;
                                 self.pending_continue =
@@ -1422,7 +1496,7 @@ impl Debugger {
                         if let Some((bp_addr, original_byte)) = self.step_over_bp {
                             if address == bp_addr {
                                 let proc = self.process.as_ref().unwrap();
-                                proc.remove_breakpoint(bp_addr, original_byte)?;
+                                proc.remove_breakpoint(pid, bp_addr, original_byte)?;
                                 proc.set_rip(event.dwThreadId, bp_addr as u64)?;
                                 self.step_over_bp = None;
 
@@ -1443,7 +1517,7 @@ impl Debugger {
                                     describe_address(self.symbols.as_ref(), bp_addr)
                                 );
                                 if let Some(proc) = self.process.as_ref() {
-                                    show_context(self.symbols.as_ref(), proc, bp_addr);
+                                    show_context(self.symbols.as_ref(), proc, pid, bp_addr);
                                 }
                                 self.running = false;
                                 self.pending_continue =
@@ -1452,7 +1526,7 @@ impl Debugger {
                             }
                         }
 
-                        if let Some(bp) = self.breakpoints.get_mut(address) {
+                        if let Some(bp) = self.breakpoints.get_mut(pid, address) {
                             self.step_target = None;
                             self.step_over_bp = None;
                             self.finish_bp = None;
@@ -1464,9 +1538,9 @@ impl Debugger {
                                 describe_address(self.symbols.as_ref(), address)
                             );
                             let proc = self.process.as_ref().unwrap();
-                            proc.remove_breakpoint(address, bp.original_byte)?;
+                            proc.remove_breakpoint(pid, address, bp.original_byte)?;
                             bp.enabled = false;
-                            show_context(self.symbols.as_ref(), proc, address);
+                            show_context(self.symbols.as_ref(), proc, pid, address);
                             proc.set_rip(event.dwThreadId, address as u64)?;
                             self.pending_breakpoint = Some(address);
                             proc.single_step(event.dwThreadId)?;
@@ -1489,7 +1563,7 @@ impl Debugger {
 
                         if let Some((hook_addr, kind)) = self.pending_leak_rearm.take() {
                             let proc = self.process.as_ref().unwrap();
-                            let new_byte = proc.set_breakpoint(hook_addr)?;
+                            let new_byte = proc.set_breakpoint(pid, hook_addr)?;
                             self.leak_hooks.insert(hook_addr, (kind, new_byte));
                             proc.continue_event(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)?;
                             continue;
@@ -1498,8 +1572,8 @@ impl Debugger {
                         let was_breakpoint_rearm = self.pending_breakpoint.is_some();
                         if let Some(addr) = self.pending_breakpoint.take() {
                             let proc = self.process.as_ref().unwrap();
-                            if let Some(bp) = self.breakpoints.get_mut(addr) {
-                                let original = proc.set_breakpoint(addr)?;
+                            if let Some(bp) = self.breakpoints.get_mut(pid, addr) {
+                                let original = proc.set_breakpoint(pid, addr)?;
                                 bp.original_byte = original;
                                 bp.enabled = true;
                             }
@@ -1541,7 +1615,7 @@ impl Debugger {
                             describe_address(self.symbols.as_ref(), address)
                         );
                         if let Some(proc) = self.process.as_ref() {
-                            show_context(self.symbols.as_ref(), proc, address);
+                            show_context(self.symbols.as_ref(), proc, pid, address);
                         }
                         self.running = false;
                         self.pending_continue =
@@ -1563,15 +1637,15 @@ impl Debugger {
                         self.pending_leak_rearm = None;
                         println!("\nInterrupted (Ctrl+C)");
                         if let Some(proc) = self.process.as_ref() {
-                            if let Ok(ctx) = proc.get_thread_context_x64(proc.main_thread_id) {
+                            if let Ok(ctx) = proc.get_thread_context_x64(proc.root_main_thread_id()) {
                                 let addr = ctx.Rip as usize;
-                                self.last_thread_id = proc.main_thread_id;
+                                self.last_thread_id = proc.root_main_thread_id();
                                 println!(
                                     "Stopped at {:#x}{}",
                                     addr,
                                     describe_address(self.symbols.as_ref(), addr)
                                 );
-                                show_context(self.symbols.as_ref(), proc, addr);
+                                show_context(self.symbols.as_ref(), proc, proc.root_pid, addr);
                             }
                         }
                         self.running = false;
@@ -1595,7 +1669,7 @@ impl Debugger {
                         describe_address(self.symbols.as_ref(), address)
                     );
                     if let Some(proc) = self.process.as_ref() {
-                        show_context(self.symbols.as_ref(), proc, address);
+                        show_context(self.symbols.as_ref(), proc, pid, address);
                     }
                     self.running = false;
                     self.pending_continue =
@@ -1603,15 +1677,34 @@ impl Debugger {
                     return Ok(());
                 }
                 CREATE_PROCESS_DEBUG_EVENT => {
-                    println!("Process created: {}", event.dwProcessId);
-                    self.threads.insert(event.dwThreadId);
+                    let proc = self.process.as_mut().unwrap();
+                    let is_root = pid == proc.root_pid;
+                    if is_root {
+                        println!("Process created: {}", pid);
+                    } else {
+                        println!("Child process created: {} (main thread {})", pid, event.dwThreadId);
+                    }
+                    self.threads.insert(event.dwThreadId, pid);
                     unsafe {
                         let info = event.u.CreateProcessInfo;
+                        // The root's own creation event is already registered
+                        // by DebuggeeProcess::launch(); only a genuine child
+                        // process needs registering here.
+                        if !is_root {
+                            proc.register_process(pid, info.hProcess, info.hThread, event.dwThreadId);
+                        }
                         if !info.hFile.is_invalid() {
-                            if let Some(symbols) = self.symbols.as_ref() {
-                                match symbols.load_module(info.hFile, info.lpBaseOfImage as u64) {
-                                    Ok(base) => println!("Symbols loaded at {:#x}", base),
-                                    Err(e) => eprintln!("Failed to load symbols: {}", e),
+                            // Symbols stay scoped to the root process only
+                            // (see the module-level note on `self.symbols`):
+                            // dbghelp's SymInitialize is inherently
+                            // per-process, so a child process's modules are
+                            // deliberately left unsymbolized here.
+                            if is_root {
+                                if let Some(symbols) = self.symbols.as_ref() {
+                                    match symbols.load_module(info.hFile, info.lpBaseOfImage as u64) {
+                                        Ok(base) => println!("Symbols loaded at {:#x}", base),
+                                        Err(e) => eprintln!("Failed to load symbols: {}", e),
+                                    }
                                 }
                             }
                             let _ = windows::Win32::Foundation::CloseHandle(info.hFile);
@@ -1619,21 +1712,44 @@ impl Debugger {
                     }
                 }
                 EXIT_PROCESS_DEBUG_EVENT => {
-                    println!("\nProcess exited with code {}", unsafe {
+                    let is_root = self.process.as_ref().is_some_and(|p| p.root_pid == pid);
+                    println!("\nProcess {} exited with code {}", pid, unsafe {
                         event.u.ExitProcess.dwExitCode
                     });
-                    self.running = false;
-                    // Without this, self.process stays Some after the
-                    // debuggee is fully gone, so a later `continue` would
-                    // pass every "is a process running?" guard and then
-                    // spin in wait_for_event forever, since a fully exited
-                    // process can never produce another debug event.
-                    self.shutdown()?;
-                    return Ok(());
+                    if is_root {
+                        self.running = false;
+                        // Without this, self.process stays Some after the
+                        // debuggee is fully gone, so a later `continue` would
+                        // pass every "is a process running?" guard and then
+                        // spin in wait_for_event forever, since a fully exited
+                        // process can never produce another debug event.
+                        self.shutdown()?;
+                        return Ok(());
+                    }
+                    // A child process exiting doesn't end the debugging
+                    // session: just stop tracking it and its threads, and
+                    // fall through to the ContinueDebugEvent at the bottom
+                    // of the loop so the OS can finish reaping it.
+                    if let Some(proc) = self.process.as_mut() {
+                        proc.remove_process(pid);
+                    }
+                    let dying: Vec<u32> = self
+                        .threads
+                        .iter()
+                        .filter(|&(_, &tpid)| tpid == pid)
+                        .map(|(&tid, _)| tid)
+                        .collect();
+                    for tid in &dying {
+                        self.threads.remove(tid);
+                        self.frozen_threads.remove(tid);
+                    }
+                    if self.locked_thread.is_some_and(|t| dying.contains(&t)) {
+                        self.locked_thread = None;
+                    }
                 }
                 CREATE_THREAD_DEBUG_EVENT => {
                     println!("Thread created: {}", event.dwThreadId);
-                    self.threads.insert(event.dwThreadId);
+                    self.threads.insert(event.dwThreadId, pid);
                     // Debug registers are per-thread and start zeroed, so a
                     // new thread must be given the currently active
                     // watchpoints explicitly or it simply won't trap on them.
@@ -1647,7 +1763,7 @@ impl Debugger {
                     // (the debuggee stays halted forever, since Windows
                     // requires that call to acknowledge every debug event
                     // before the process can run again).
-                    if let Err(e) = self.apply_watchpoints_to_thread(event.dwThreadId) {
+                    if let Err(e) = self.apply_watchpoints_to_thread(pid, event.dwThreadId) {
                         eprintln!(
                             "Warning: could not sync watchpoints to thread {}: {}",
                             event.dwThreadId, e
@@ -1681,8 +1797,15 @@ impl Debugger {
                 LOAD_DLL_DEBUG_EVENT => unsafe {
                     let info = event.u.LoadDll;
                     if !info.hFile.is_invalid() {
-                        if let Some(symbols) = self.symbols.as_ref() {
-                            let _ = symbols.load_module(info.hFile, info.lpBaseOfDll as u64);
+                        // Symbols are root-process-only (see the
+                        // module-level scoping note); a child process's DLL
+                        // loads are intentionally not registered with the
+                        // (root-bound) resolver.
+                        let is_root = self.process.as_ref().is_some_and(|p| p.root_pid == pid);
+                        if is_root {
+                            if let Some(symbols) = self.symbols.as_ref() {
+                                let _ = symbols.load_module(info.hFile, info.lpBaseOfDll as u64);
+                            }
                         }
                         let _ = windows::Win32::Foundation::CloseHandle(info.hFile);
                     }
@@ -1709,6 +1832,7 @@ struct DebugEvalContext<'a> {
     proc: &'a DebuggeeProcess,
     symbols: Option<&'a SymbolResolver>,
     thread_id: u32,
+    pid: u32,
     ctx: AlignedContext,
 }
 
@@ -1796,7 +1920,7 @@ impl eval::EvalContext for DebugEvalContext<'_> {
     fn read_typed(&self, loc: eval::TypedLocation) -> Option<eval::Value> {
         let n = (loc.size.min(8)) as usize;
         let mut buf = [0u8; 8];
-        let read = self.proc.read_memory(loc.address as usize, &mut buf[..n]).ok()?;
+        let read = self.proc.read_memory(self.pid, loc.address as usize, &mut buf[..n]).ok()?;
         if read < n {
             return None;
         }
@@ -1821,7 +1945,7 @@ impl eval::EvalContext for DebugEvalContext<'_> {
             eval::ValueKind::Int => value.as_i64().to_le_bytes(),
         };
         self.proc
-            .write_memory(loc.address as usize, &bytes[..n])
+            .write_memory(self.pid, loc.address as usize, &bytes[..n])
             .is_ok_and(|written| written == n)
     }
 
@@ -2094,7 +2218,7 @@ fn format_scalar(
         if let Some(pointee) = symbols.type_pointee(ty.0, ty.1) {
             if is_char_type(symbols, ty.0, pointee) {
                 let max_len = settings.elements.min(4096).max(1);
-                if let Some(s) = read_c_string(ctx.proc, n as u64, max_len) {
+                if let Some(s) = read_c_string(ctx.proc, ctx.pid, n as u64, max_len) {
                     return format!("{} \"{}\"", base, escape_c_string(&s));
                 }
             }
@@ -2160,11 +2284,11 @@ fn format_value_with_spec(
 // the very first byte couldn't be read; a failure partway through just
 // truncates the string, matching how a debugger would show a string that
 // runs off the end of a mapped region.
-fn read_c_string(proc: &DebuggeeProcess, address: u64, max_len: usize) -> Option<String> {
+fn read_c_string(proc: &DebuggeeProcess, pid: u32, address: u64, max_len: usize) -> Option<String> {
     let mut bytes = Vec::new();
     for i in 0..max_len {
         let mut byte = [0u8; 1];
-        match proc.read_memory((address as usize).wrapping_add(i), &mut byte) {
+        match proc.read_memory(pid, (address as usize).wrapping_add(i), &mut byte) {
             Ok(1) if byte[0] != 0 => bytes.push(byte[0]),
             Ok(1) => break,
             _ => {
@@ -2211,13 +2335,14 @@ fn describe_address(symbols: Option<&SymbolResolver>, address: usize) -> String 
     format!(" [{}+{:#x}{}]", info.name, info.displacement, location)
 }
 
-fn show_context(symbols: Option<&SymbolResolver>, proc: &DebuggeeProcess, address: usize) {
-    show_context_with_window(symbols, proc, address, 3, 2);
+fn show_context(symbols: Option<&SymbolResolver>, proc: &DebuggeeProcess, pid: u32, address: usize) {
+    show_context_with_window(symbols, proc, pid, address, 3, 2);
 }
 
 fn show_context_with_window(
     symbols: Option<&SymbolResolver>,
     proc: &DebuggeeProcess,
+    pid: u32,
     address: usize,
     before: usize,
     after: usize,
@@ -2231,7 +2356,7 @@ fn show_context_with_window(
             }
         }
     }
-    print_disassembly(proc, address);
+    print_disassembly(proc, pid, address);
 }
 
 fn print_source(file: &std::path::Path, line: u32, before: usize, after: usize) -> bool {
@@ -2253,9 +2378,9 @@ fn print_source(file: &std::path::Path, line: u32, before: usize, after: usize) 
     true
 }
 
-fn print_disassembly(proc: &DebuggeeProcess, address: usize) {
+fn print_disassembly(proc: &DebuggeeProcess, pid: u32, address: usize) {
     let mut buf = vec![0u8; 128];
-    match proc.read_memory(address, &mut buf) {
+    match proc.read_memory(pid, address, &mut buf) {
         Ok(read) if read > 0 => {
             for line in crate::disasm::disassemble(&buf[..read], address as u64, 8) {
                 println!("{}", line);
