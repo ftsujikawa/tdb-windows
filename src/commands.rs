@@ -50,6 +50,7 @@ pub enum Command {
     Print(String, Option<char>),
     Set(String),
     Show(ShowKind),
+    Disassemble { target: Option<String>, count: usize },
     Leak(LeakAction),
     SetPrint(PrintOption),
     ShowPrintSettings,
@@ -228,6 +229,18 @@ pub fn parse(input: &str) -> Result<Command> {
             };
             Ok(Command::Show(kind))
         }
+        "dis" | "disassemble" | "disas" => {
+            let (target, count) = if args.is_empty() {
+                (None, 10)
+            } else if args.len() == 1 {
+                (Some(args[0].to_string()), 10)
+            } else {
+                let count = args[args.len() - 1].parse().unwrap_or(10);
+                let target = args[..args.len() - 1].join(" ");
+                (Some(target), count)
+            };
+            Ok(Command::Disassemble { target, count })
+        }
         "leak" | "leaks" => {
             let action = match args.first().map(|s| s.to_lowercase()).as_deref() {
                 Some("start") | Some("on") => LeakAction::Start,
@@ -352,6 +365,7 @@ pub fn help_text() -> &'static str {
   l, list [addr|symbol|file:line]  Show source (current position if omitted)
   regs, registers              Show registers
   x, memory <addr> [count]     Dump memory
+  dis, disassemble [addr|symbol|file:line] [count]  Disassemble (current position if omitted)
   bt, tb, backtrace             Show call stack
   p, print[/fmt] <expr>        Evaluate a C expression
       fmt: x d u o t c f a z s (hex/dec/udec/oct/bin/char/float/addr/zpad/string)

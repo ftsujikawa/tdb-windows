@@ -246,6 +246,7 @@ impl Debugger {
             Command::Print(expr, fmt) => self.print_expr(&expr, fmt)?,
             Command::Set(assignment) => self.set_expr(&assignment)?,
             Command::Show(kind) => self.show_vars(kind)?,
+            Command::Disassemble { target, count } => self.disassemble_command(target.as_deref(), count)?,
             Command::Leak(action) => self.leak_command(action)?,
             Command::SetPrint(option) => self.set_print_option(option),
             Command::ShowPrintSettings => self.show_print_settings(),
@@ -1047,6 +1048,48 @@ impl Debugger {
 
         let proc = self.process.as_ref().unwrap();
         show_context_with_window(self.symbols.as_ref(), proc, pid, address, 5, 5);
+        Ok(())
+    }
+
+    fn disassemble_command(&mut self, target: Option<&str>, count: usize) -> Result<()> {
+        if self.process.is_none() {
+            eprintln!("No process is running.");
+            return Ok(());
+        }
+
+        let (pid, address) = match target {
+            Some(target) => match self.resolve_target_address(target)? {
+                Some(resolved) => resolved,
+                None => return Ok(()),
+            },
+            None => {
+                let proc = self.process.as_ref().unwrap();
+                (
+                    self.current_pid(),
+                    proc.get_thread_context_x64(self.last_thread_id)?.Rip as usize,
+                )
+            }
+        };
+
+        let proc = self.process.as_ref().unwrap();
+
+        let mut buf = vec![0u8; count * 16];
+        let read = proc.read_memory(pid, address, &mut buf)?;
+
+        // Breakpoints are 0xCC in live memory; show the original bytes
+        // so disassembly doesn't start with 'int 3' and misdecode.
+        for bp in self.breakpoints.list() {
+            if bp.pid == pid {
+                let offset = bp.address.saturating_sub(address);
+                if offset < read {
+                    buf[offset] = bp.original_byte;
+                }
+            }
+        }
+
+        for line in crate::disasm::disassemble(&buf[..read], address as u64, count) {
+            println!("{}", line);
+        }
         Ok(())
     }
 
@@ -2356,7 +2399,7 @@ fn show_context_with_window(
             }
         }
     }
-    print_disassembly(proc, pid, address);
+    print_disassembly(proc, pid, address, 8);
 }
 
 fn print_source(file: &std::path::Path, line: u32, before: usize, after: usize) -> bool {
@@ -2378,11 +2421,11 @@ fn print_source(file: &std::path::Path, line: u32, before: usize, after: usize) 
     true
 }
 
-fn print_disassembly(proc: &DebuggeeProcess, pid: u32, address: usize) {
-    let mut buf = vec![0u8; 128];
+fn print_disassembly(proc: &DebuggeeProcess, pid: u32, address: usize, count: usize) {
+    let mut buf = vec![0u8; count * 16];
     match proc.read_memory(pid, address, &mut buf) {
         Ok(read) if read > 0 => {
-            for line in crate::disasm::disassemble(&buf[..read], address as u64, 8) {
+            for line in crate::disasm::disassemble(&buf[..read], address as u64, count) {
                 println!("{}", line);
             }
         }
