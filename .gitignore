@@ -3,3 +3,9 @@ examples/*.exe
 examples/*.obj
 examples/*.pdb
 examples/*.ilk
+tests/fixtures/*.exe
+tests/fixtures/*.obj
+tests/fixtures/*.pdb
+tests/fixtures/*.ilk
+tests/fixtures/_build_*.bat
+vc140.pdb
