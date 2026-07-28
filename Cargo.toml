@@ -22,3 +22,6 @@ thiserror = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 nu-ansi-term = "0.50"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "masm", "instr_info"] }
+
+[dev-dependencies]
+os_pipe = "1.2"

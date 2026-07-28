@@ -165,22 +165,36 @@ pub struct TdbSession {
 
 impl TdbSession {
     /// Spawns `tdb-windows.exe <target_exe>`.
+    ///
+    /// stdout and stderr are both wired to the *same* OS pipe (rather than
+    /// two independently piped fds read by two separate pump threads): the
+    /// debugger is single-threaded, so its writes to stdout and stderr are
+    /// strictly ordered relative to each other, but two independent reader
+    /// threads racing to append to a shared buffer can't preserve that
+    /// order - a stdout chunk sitting unread in its pipe can lose the race
+    /// to a stderr chunk that arrived later, scrambling the captured text
+    /// (e.g. splitting an `eprintln!` line apart with unrelated stdout
+    /// output). Merging into one pipe up front makes the kernel the single
+    /// arbiter of ordering, which matches how the process actually wrote
+    /// the bytes.
     pub fn spawn(target_exe: &Path) -> Self {
+        let (reader, writer) = os_pipe::pipe().expect("failed to create merged stdout/stderr pipe");
+        let writer_clone = writer
+            .try_clone()
+            .expect("failed to clone pipe writer for stderr");
+
         let mut child = Command::new(tdb_exe())
             .arg(target_exe)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(writer)
+            .stderr(writer_clone)
             .spawn()
             .expect("failed to spawn tdb-windows.exe");
 
         let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
         let buffer = Arc::new(Mutex::new(String::new()));
 
-        spawn_pump(stdout, buffer.clone());
-        spawn_pump(stderr, buffer.clone());
+        spawn_pump(reader, buffer.clone());
 
         Self {
             child,
